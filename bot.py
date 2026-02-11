@@ -31,8 +31,8 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8463379208:AAGNQgGvZT6qMVdPpEtJhW9xN99M5ma6Pzc")
-FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "bf1f95150ac74b3f804648682e0d5677")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "YOUR_FOOTBALL_DATA_API_KEY")
 FOOTBALL_API_BASE = "https://api.football-data.org/v4"
 
 # ── Free-tier leagues (football-data.org) ─────────────────────────────────────
