@@ -740,14 +740,6 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handler(update, context)
 
 
-async def _send(update, text, parse_mode=ParseMode.MARKDOWN, reply_markup=None):
-    """Send message from either a regular message or a callback query."""
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    elif update.message:
-        await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-
-
 # ── Command Handlers ──────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1111,31 +1103,31 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Button Navigation Wrappers ────────────────────────────────────────────────
 # When a user taps an inline button, update.message is None.
-# These wrappers set update.message so existing handlers work seamlessly.
+# We wrap update in a SimpleNamespace so existing handlers can use .message.reply_text
+
+import types
+
+def _fake_update(update):
+    """Create a namespace with .message pointing to the callback's message."""
+    return types.SimpleNamespace(message=update.callback_query.message)
 
 async def cmd_tips_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_tips(update, context)
+    await cmd_tips(_fake_update(update), context)
 
 async def cmd_predict_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_predict(update, context)
+    await cmd_predict(_fake_update(update), context)
 
 async def cmd_today_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_today(update, context)
+    await cmd_today(_fake_update(update), context)
 
 async def cmd_streaks_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_streaks(update, context)
+    await cmd_streaks(_fake_update(update), context)
 
 async def cmd_goals_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_goals(update, context)
+    await cmd_goals(_fake_update(update), context)
 
 async def cmd_league_from_btn(update, context):
-    update.message = update.callback_query.message
-    await cmd_league(update, context)
+    await cmd_league(_fake_update(update), context)
 
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
