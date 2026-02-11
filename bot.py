@@ -700,6 +700,54 @@ def format_full_report(streaks, league_name):
     return "\n".join(lines)
 
 
+# ── Navigation Buttons ────────────────────────────────────────────────────────
+
+def nav_keyboard(exclude=None):
+    """Build inline navigation buttons, optionally excluding the current page."""
+    buttons = [
+        ("\U0001f52e Tips", "nav_tips"),
+        ("\U0001f916 Predict", "nav_predict"),
+        ("\U0001f4c5 Today", "nav_today"),
+    ]
+    row1 = [InlineKeyboardButton(label, callback_data=cb) for label, cb in buttons if cb != exclude]
+
+    buttons2 = [
+        ("\U0001f525 Streaks", "nav_streaks"),
+        ("\u26bd Goals", "nav_goals"),
+        ("\U0001f3df\ufe0f League", "nav_league"),
+    ]
+    row2 = [InlineKeyboardButton(label, callback_data=cb) for label, cb in buttons2 if cb != exclude]
+
+    return InlineKeyboardMarkup([row1, row2])
+
+
+async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle navigation button presses by routing to the appropriate command."""
+    query = update.callback_query
+    await query.answer()
+
+    # Map nav callbacks to command functions
+    nav_map = {
+        "nav_tips": cmd_tips_from_btn,
+        "nav_predict": cmd_predict_from_btn,
+        "nav_today": cmd_today_from_btn,
+        "nav_streaks": cmd_streaks_from_btn,
+        "nav_goals": cmd_goals_from_btn,
+        "nav_league": cmd_league_from_btn,
+    }
+    handler = nav_map.get(query.data)
+    if handler:
+        await handler(update, context)
+
+
+async def _send(update, text, parse_mode=ParseMode.MARKDOWN, reply_markup=None):
+    """Send message from either a regular message or a callback query."""
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    elif update.message:
+        await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
 # ── Command Handlers ──────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,7 +778,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  \u277b Head-to-head record\n\n"
         "\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
@@ -753,6 +801,7 @@ async def cmd_streaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(full) > 4000:
             for m in msgs: await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
         else: await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\u2b07\ufe0f *What next?*", parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_streaks"))
     else: await update.message.reply_text("\u274c Could not fetch streak data.")
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -773,6 +822,7 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(full) > 4000:
             for m in msgs: await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
         else: await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\u2b07\ufe0f *What next?*", parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_goals"))
     else: await update.message.reply_text("\u274c Could not fetch goal streak data.")
 
 async def cmd_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -877,7 +927,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"  \U0001f550 {home} vs {away} ({ko})")
         except Exception as e: logger.error(f"Error today {code}: {e}")
     if not found: lines.append("\nNo matches today.")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_today"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -982,7 +1032,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if current_msg:
         current_msg += "\n\n\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
-        await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_predict"))
 
 
 async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1054,9 +1104,38 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg2.append(format_tip(pred, i + mid))
             msg2.append("")
         msg2.extend(lines[-8:])
-        await update.message.reply_text("\n".join(msg2), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("\n".join(msg2), parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_tips"))
     else:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_tips"))
+
+
+# ── Button Navigation Wrappers ────────────────────────────────────────────────
+# When a user taps an inline button, update.message is None.
+# These wrappers set update.message so existing handlers work seamlessly.
+
+async def cmd_tips_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_tips(update, context)
+
+async def cmd_predict_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_predict(update, context)
+
+async def cmd_today_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_today(update, context)
+
+async def cmd_streaks_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_streaks(update, context)
+
+async def cmd_goals_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_goals(update, context)
+
+async def cmd_league_from_btn(update, context):
+    update.message = update.callback_query.message
+    await cmd_league(update, context)
 
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
@@ -1211,6 +1290,7 @@ def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("tips", cmd_tips))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav_"))
     app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league_"))
     app.add_handler(CallbackQueryHandler(region_callback, pattern=r"^region_"))
     app.add_handler(CallbackQueryHandler(back_to_regions_callback, pattern=r"^back_to_regions$"))
