@@ -1,37 +1,31 @@
 """
-Football Streak Tracker & Predictor — Telegram Bot
-====================================================
-Aggregates daily football winning streaks, goal-scoring streaks,
-and uses statistical modelling (Poisson, form weighting, strength
-ratings) to predict match outcomes.
+Football Streak Tracker & AI Predictor — Telegram Bot v2
+=========================================================
+Uses ELO ratings, Poisson modelling, form weighting, league position,
+streak momentum, and head-to-head analysis to predict match outcomes.
+
+Inspired by:
+  - ProphitBet (feature engineering, ensemble approach)
+  - jkrusina/SoccerPredictor (time-series, double chance)
+  - ronyka77/SoccerPredictor (ELO ratings, stacked models, Poisson xG)
 
 Commands:
-  /start         - Welcome message & instructions
-  /streaks       - Top winning streaks across leagues
-  /goals         - Top goal-scoring streaks
-  /league        - Pick a league for detailed streaks
-  /today         - Today's matches
-  /predict       - AI predictions for today's matches
-  /tips          - Best picks of the day (highest confidence)
-  /help          - Show all commands
+  /start, /help   - Welcome & instructions
+  /streaks         - Top winning streaks across leagues
+  /goals           - Top goal-scoring streaks
+  /league          - Pick a league for detailed streaks
+  /today           - Today's matches
+  /predict         - AI predictions for today's matches
+  /tips            - Best picks of the day (highest confidence)
 """
 
-import os
-import logging
-import json
-import asyncio
-import math
+import os, logging, asyncio, math
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
@@ -52,7 +46,6 @@ FREE_LEAGUES = {
     "WC": {"name": "FIFA World Cup", "flag": "\U0001f30d", "country": "World", "type": "CUP"},
     "EC": {"name": "European Championship", "flag": "\U0001f1ea\U0001f1fa", "country": "Europe", "type": "CUP"},
 }
-
 PAID_LEAGUES = {
     "EL": {"name": "Europa League", "flag": "\U0001f7e0", "country": "Europe", "type": "CUP"},
     "CLI": {"name": "Conference League", "flag": "\U0001f7e2", "country": "Europe", "type": "CUP"},
@@ -72,7 +65,6 @@ PAID_LEAGUES = {
     "TSL": {"name": "Super Lig", "flag": "\U0001f1f9\U0001f1f7", "country": "Turkey", "type": "LEAGUE"},
     "GSL": {"name": "Super League", "flag": "\U0001f1ec\U0001f1f7", "country": "Greece", "type": "LEAGUE"},
 }
-
 LEAGUES = {**FREE_LEAGUES, **PAID_LEAGUES}
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -86,10 +78,7 @@ class FootballAPI:
 
     async def _get(self, endpoint, params=None):
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{FOOTBALL_API_BASE}{endpoint}",
-                headers=self.headers, params=params or {}, timeout=15,
-            )
+            resp = await client.get(f"{FOOTBALL_API_BASE}{endpoint}", headers=self.headers, params=params or {}, timeout=15)
             resp.raise_for_status()
             return resp.json()
 
@@ -102,31 +91,23 @@ class FootballAPI:
 
     async def get_todays_matches(self, league_code):
         today = datetime.utcnow().strftime("%Y-%m-%d")
-        params = {"dateFrom": today, "dateTo": today}
-        data = await self._get(f"/competitions/{league_code}/matches", params)
+        data = await self._get(f"/competitions/{league_code}/matches", {"dateFrom": today, "dateTo": today})
         return data.get("matches", [])
 
     async def get_standings(self, league_code):
-        data = await self._get(f"/competitions/{league_code}/standings")
-        for s in data.get("standings", []):
-            if s.get("type") == "TOTAL":
-                return s.get("table", [])
+        try:
+            data = await self._get(f"/competitions/{league_code}/standings")
+            for s in data.get("standings", []):
+                if s.get("type") == "TOTAL":
+                    return s.get("table", [])
+        except Exception:
+            pass
         return []
-
 
 api = FootballAPI(FOOTBALL_API_KEY)
 
-VALID_STAGES = {
-    "REGULAR_SEASON", "GROUP_STAGE", "LEAGUE_STAGE",
-    "ROUND_OF_16", "QUARTER_FINALS", "SEMI_FINALS", "FINAL",
-    "LAST_16", "LAST_32", "LAST_64",
-}
-SKIP_STAGES = {
-    "FRIENDLY", "PRELIMINARY_ROUND", "QUALIFICATION",
-    "QUALIFICATION_ROUND_1", "QUALIFICATION_ROUND_2", "QUALIFICATION_ROUND_3",
-    "PLAYOFF_ROUND", "PLAYOFFS",
-}
-
+VALID_STAGES = {"REGULAR_SEASON","GROUP_STAGE","LEAGUE_STAGE","ROUND_OF_16","QUARTER_FINALS","SEMI_FINALS","FINAL","LAST_16","LAST_32","LAST_64"}
+SKIP_STAGES = {"FRIENDLY","PRELIMINARY_ROUND","QUALIFICATION","QUALIFICATION_ROUND_1","QUALIFICATION_ROUND_2","QUALIFICATION_ROUND_3","PLAYOFF_ROUND","PLAYOFFS"}
 
 def is_valid_stage(match):
     stage = match.get("stage", "").upper()
@@ -134,6 +115,79 @@ def is_valid_stage(match):
     if VALID_STAGES and stage and stage not in VALID_STAGES: return False
     return True
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ELO RATING SYSTEM (inspired by ronyka77/SoccerPredictor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_elo_ratings(matches, k_factor=32, home_advantage=65):
+    """
+    Calculate ELO ratings for all teams from historical match data.
+    
+    Uses the standard ELO formula adapted for football:
+      - K-factor: how much a single result changes the rating (32 = moderate)
+      - Home advantage: ELO points added to home team's expected score
+      - Goal difference multiplier: bigger wins = bigger rating changes
+    
+    All teams start at 1500 (league average).
+    """
+    elo = defaultdict(lambda: 1500.0)
+    
+    # Sort matches chronologically
+    sorted_matches = sorted(
+        [m for m in matches if m.get("status") == "FINISHED" and is_valid_stage(m)],
+        key=lambda m: m.get("utcDate", "")
+    )
+    
+    for match in sorted_matches:
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+        hg = match["score"]["fullTime"]["home"]
+        ag = match["score"]["fullTime"]["away"]
+        if hg is None or ag is None:
+            continue
+        
+        # Expected scores (with home advantage)
+        dr = (elo[home] + home_advantage) - elo[away]
+        exp_home = 1.0 / (1.0 + 10.0 ** (-dr / 400.0))
+        exp_away = 1.0 - exp_home
+        
+        # Actual scores
+        if hg > ag:
+            actual_home, actual_away = 1.0, 0.0
+        elif hg < ag:
+            actual_home, actual_away = 0.0, 1.0
+        else:
+            actual_home, actual_away = 0.5, 0.5
+        
+        # Goal difference multiplier (bigger wins = bigger ELO change)
+        goal_diff = abs(hg - ag)
+        if goal_diff <= 1:
+            gd_mult = 1.0
+        elif goal_diff == 2:
+            gd_mult = 1.5
+        elif goal_diff == 3:
+            gd_mult = 1.75
+        else:
+            gd_mult = 1.75 + (goal_diff - 3) * 0.125
+        
+        # Update ratings
+        change = k_factor * gd_mult
+        elo[home] += change * (actual_home - exp_home)
+        elo[away] += change * (actual_away - exp_away)
+    
+    return dict(elo)
+
+
+def elo_win_probability(home_elo, away_elo, home_advantage=65):
+    """Calculate expected win probability from ELO ratings."""
+    dr = (home_elo + home_advantage) - away_elo
+    return 1.0 / (1.0 + 10.0 ** (-dr / 400.0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STREAK CALCULATION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def calculate_streaks(matches, league_only=True):
     team_matches = defaultdict(list)
@@ -170,14 +224,30 @@ def calculate_streaks(matches, league_only=True):
         for m in ml:
             if m["goals_conceded"] == 0: cs += 1
             else: break
-        form = "".join({"W": chr(0x1F7E2), "D": chr(0x1F7E1), "L": chr(0x1F534)}[m["result"]] for m in ml[:5])
+        form = "".join({
+            "W": "\U0001f7e2", "D": "\U0001f7e1", "L": "\U0001f534"
+        }[m["result"]] for m in ml[:5])
         rg = sum(m["goals_scored"] for m in ml[:5])
-        streaks[team] = {"win_streak": ws, "unbeaten_streak": ub, "goal_streak": gs, "clean_sheet_streak": cs, "form": form, "recent_goals": rg, "matches_played": len(ml), "last_match": ml[0] if ml else None}
+        rc = sum(m["goals_conceded"] for m in ml[:5])
+        
+        # Goal difference momentum (last 5 vs previous 5)
+        recent_gd = sum(m["goals_scored"] - m["goals_conceded"] for m in ml[:5])
+        prev_gd = sum(m["goals_scored"] - m["goals_conceded"] for m in ml[5:10]) if len(ml) >= 10 else 0
+        gd_momentum = recent_gd - prev_gd  # positive = improving
+        
+        streaks[team] = {
+            "win_streak": ws, "unbeaten_streak": ub,
+            "goal_streak": gs, "clean_sheet_streak": cs,
+            "form": form, "recent_goals": rg, "recent_conceded": rc,
+            "gd_momentum": gd_momentum,
+            "matches_played": len(ml),
+            "last_match": ml[0] if ml else None,
+        }
     return streaks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PREDICTION ENGINE — Poisson Model + Form Weighting + Streaks
+# PREDICTION ENGINE v2 — ELO + Poisson + Form + Position + Streaks + H2H
 # ══════════════════════════════════════════════════════════════════════════════
 
 def poisson_pmf(k, lam):
@@ -186,7 +256,7 @@ def poisson_pmf(k, lam):
 
 
 def build_team_stats(matches):
-    """Build per-team attack/defense strength ratings from historical matches."""
+    """Build comprehensive per-team stats from historical matches."""
     team_data = defaultdict(lambda: {
         "home_scored": [], "home_conceded": [],
         "away_scored": [], "away_conceded": [],
@@ -196,7 +266,6 @@ def build_team_stats(matches):
     })
 
     finished = [m for m in matches if m.get("status") == "FINISHED" and is_valid_stage(m)]
-
     for match in finished:
         home = match["homeTeam"]["name"]
         away = match["awayTeam"]["name"]
@@ -226,65 +295,63 @@ def build_team_stats(matches):
 
     all_hg = [m["score"]["fullTime"]["home"] for m in finished if m["score"]["fullTime"]["home"] is not None]
     all_ag = [m["score"]["fullTime"]["away"] for m in finished if m["score"]["fullTime"]["away"] is not None]
-    league_avg_home = sum(all_hg) / max(len(all_hg), 1)
-    league_avg_away = sum(all_ag) / max(len(all_ag), 1)
+    lah = sum(all_hg) / max(len(all_hg), 1)
+    laa = sum(all_ag) / max(len(all_ag), 1)
 
-    stats = {"_league_avg_home": league_avg_home, "_league_avg_away": league_avg_away}
-
+    stats = {"_league_avg_home": lah, "_league_avg_away": laa}
     for team, data in team_data.items():
         n_all = max(len(data["all_scored"]), 1)
         n_home = max(len(data["home_scored"]), 1)
         n_away = max(len(data["away_scored"]), 1)
 
-        avg_scored = sum(data["all_scored"]) / n_all
-        avg_conceded = sum(data["all_conceded"]) / n_all
-        home_avg_scored = sum(data["home_scored"]) / n_home
-        away_avg_scored = sum(data["away_scored"]) / n_away
+        home_attack = (sum(data["home_scored"]) / n_home) / max(lah, 0.5)
+        home_defense = (sum(data["home_conceded"]) / n_home) / max(laa, 0.5)
+        away_attack = (sum(data["away_scored"]) / n_away) / max(laa, 0.5)
+        away_defense = (sum(data["away_conceded"]) / n_away) / max(lah, 0.5)
 
-        attack_strength = avg_scored / max(league_avg_home, 0.5)
-        defense_strength = avg_conceded / max(league_avg_away, 0.5)
-        home_attack = home_avg_scored / max(league_avg_home, 0.5)
-        home_defense = sum(data["home_conceded"]) / n_home / max(league_avg_away, 0.5)
-        away_attack = away_avg_scored / max(league_avg_away, 0.5)
-        away_defense = sum(data["away_conceded"]) / n_away / max(league_avg_home, 0.5)
-
+        # Form rating with exponential decay (recent matches weighted higher)
         data["results"].sort(key=lambda x: x[0], reverse=True)
-        form_points = 0
-        form_weight_total = 0
-        for i, (_, result) in enumerate(data["results"][:10]):
-            weight = math.exp(-0.15 * i)
-            form_weight_total += weight
-            if result == "W": form_points += 3 * weight
-            elif result == "D": form_points += 1 * weight
-        form_rating = form_points / max(form_weight_total, 1) / 3.0
+        fp, fw = 0, 0
+        for i, (_, r) in enumerate(data["results"][:10]):
+            w = math.exp(-0.15 * i)
+            fw += w
+            if r == "W": fp += 3 * w
+            elif r == "D": fp += 1 * w
+        form_rating = fp / max(fw, 1) / 3.0
 
         results_only = [r for _, r in data["results"]]
-        total_games = max(len(results_only), 1)
-
+        total = max(len(results_only), 1)
         btts_count = sum(1 for s, c in zip(data["all_scored"], data["all_conceded"]) if s >= 1 and c >= 1)
-        over25_count = sum(1 for s, c in zip(data["all_scored"], data["all_conceded"]) if s + c >= 3)
+        o15_count = sum(1 for s, c in zip(data["all_scored"], data["all_conceded"]) if s + c >= 2)
+        o25_count = sum(1 for s, c in zip(data["all_scored"], data["all_conceded"]) if s + c >= 3)
 
         stats[team] = {
-            "attack_strength": attack_strength, "defense_strength": defense_strength,
             "home_attack": home_attack, "home_defense": home_defense,
             "away_attack": away_attack, "away_defense": away_defense,
-            "avg_scored": avg_scored, "avg_conceded": avg_conceded,
-            "home_avg_scored": home_avg_scored, "away_avg_scored": away_avg_scored,
+            "avg_scored": sum(data["all_scored"]) / n_all,
+            "avg_conceded": sum(data["all_conceded"]) / n_all,
             "form_rating": form_rating,
-            "win_rate": results_only.count("W") / total_games,
-            "draw_rate": results_only.count("D") / total_games,
-            "loss_rate": results_only.count("L") / total_games,
+            "win_rate": results_only.count("W") / total,
+            "draw_rate": results_only.count("D") / total,
             "btts_rate": btts_count / n_all,
-            "over25_rate": over25_count / n_all,
+            "over15_rate": o15_count / n_all,
+            "over25_rate": o25_count / n_all,
             "matches_played": len(data["results"]),
             "h2h": data["h2h"],
         }
-
     return stats
 
 
-def predict_match(home_team, away_team, stats, streaks):
-    """Generate full prediction using Poisson model + form + streaks + H2H."""
+def predict_match(home_team, away_team, stats, streaks, elo_ratings, standings_map):
+    """
+    Full prediction using 6-layer model:
+      1. Poisson base xG (attack/defense strength)
+      2. ELO rating adjustment
+      3. League position factor
+      4. Form weighting
+      5. Streak momentum
+      6. Head-to-head adjustment
+    """
     hs = stats.get(home_team)
     aws = stats.get(away_team)
     lah = stats.get("_league_avg_home", 1.4)
@@ -293,36 +360,64 @@ def predict_match(home_team, away_team, stats, streaks):
     if not hs or not aws:
         return {
             "home_team": home_team, "away_team": away_team,
-            "home_xg": lah, "away_xg": laa,
+            "home_xg": round(lah, 2), "away_xg": round(laa, 2),
             "home_win": 0.45, "draw": 0.25, "away_win": 0.30,
-            "over25": 0.50, "btts": 0.50,
+            "over15": 0.65, "btts": 0.50, "double_home": 0.70, "double_away": 0.55,
             "confidence": "\u26aa Low", "confidence_score": 0.3,
-            "prediction": "Insufficient data", "goals_prediction": "~2-3 goals",
+            "prediction": "Insufficient data", "goals_prediction": "~2 goals",
             "factors": ["Limited data available"], "score_line": "? - ?",
-            "home_form": "", "away_form": "",
+            "home_form": "", "away_form": "", "home_elo": 1500, "away_elo": 1500,
+            "home_pos": "?", "away_pos": "?",
         }
 
-    # Step 1: Base xG (Poisson)
+    # ── Layer 1: Base xG from Poisson model ──────────────────────────────
     home_xg = hs["home_attack"] * aws["away_defense"] * lah
     away_xg = aws["away_attack"] * hs["home_defense"] * laa
 
-    # Step 2: Home advantage (+8%)
-    home_xg *= 1.08
+    # ── Layer 2: ELO rating adjustment (+/- 12%) ─────────────────────────
+    home_elo = elo_ratings.get(home_team, 1500)
+    away_elo = elo_ratings.get(away_team, 1500)
+    elo_diff = (home_elo - away_elo) / 400.0  # normalised
+    elo_factor = max(-0.12, min(0.12, elo_diff * 0.08))
+    home_xg *= (1 + elo_factor)
+    away_xg *= (1 - elo_factor)
 
-    # Step 3: Form adjustment (+/- 15%)
+    # ── Layer 3: League position factor (+/- 8%) ─────────────────────────
+    home_pos = standings_map.get(home_team, 10)
+    away_pos = standings_map.get(away_team, 10)
+    total_teams = max(len(standings_map), 20)
+    # Normalise: top of table = high, bottom = low (0 to 1 scale)
+    home_pos_strength = 1.0 - (home_pos - 1) / max(total_teams - 1, 1)
+    away_pos_strength = 1.0 - (away_pos - 1) / max(total_teams - 1, 1)
+    pos_diff = home_pos_strength - away_pos_strength  # -1 to +1
+    home_xg *= (1 + pos_diff * 0.08)
+    away_xg *= (1 - pos_diff * 0.08)
+
+    # ── Layer 4: Home advantage boost (+10%) ─────────────────────────────
+    home_xg *= 1.10
+
+    # ── Layer 5: Form adjustment (+/- 15%) ───────────────────────────────
     form_diff = hs["form_rating"] - aws["form_rating"]
     home_xg *= (1 + form_diff * 0.15)
     away_xg *= (1 - form_diff * 0.15)
 
-    # Step 4: Streak momentum (+/- 10%)
-    hstreak = streaks.get(home_team, {})
-    astreak = streaks.get(away_team, {})
-    home_xg *= (1 + min(hstreak.get("win_streak", 0), 5) * 0.02)
-    away_xg *= (1 + min(astreak.get("win_streak", 0), 5) * 0.02)
-    if hstreak.get("goal_streak", 0) >= 5: home_xg *= 1.05
-    if astreak.get("goal_streak", 0) >= 5: away_xg *= 1.05
+    # ── Layer 6: Streak momentum (+/- 10%) ───────────────────────────────
+    hsk = streaks.get(home_team, {})
+    ask = streaks.get(away_team, {})
+    home_xg *= (1 + min(hsk.get("win_streak", 0), 5) * 0.02)
+    away_xg *= (1 + min(ask.get("win_streak", 0), 5) * 0.02)
+    if hsk.get("goal_streak", 0) >= 5: home_xg *= 1.05
+    if ask.get("goal_streak", 0) >= 5: away_xg *= 1.05
+    
+    # Goal difference momentum boost
+    gd_mom_home = hsk.get("gd_momentum", 0)
+    gd_mom_away = ask.get("gd_momentum", 0)
+    if gd_mom_home > 3: home_xg *= 1.03
+    elif gd_mom_home < -3: home_xg *= 0.97
+    if gd_mom_away > 3: away_xg *= 1.03
+    elif gd_mom_away < -3: away_xg *= 0.97
 
-    # Step 5: H2H adjustment (+/- 8%)
+    # ── Layer 7: Head-to-head adjustment (+/- 8%) ────────────────────────
     h2h = hs.get("h2h", {}).get(away_team, {})
     h2h_results = h2h.get("results", [])
     if len(h2h_results) >= 3:
@@ -330,10 +425,11 @@ def predict_match(home_team, away_team, stats, streaks):
         home_xg *= (1 + h2h_dom * 0.16)
         away_xg *= (1 - h2h_dom * 0.16)
 
-    home_xg = max(0.3, min(home_xg, 4.5))
+    # Clamp
+    home_xg = max(0.25, min(home_xg, 4.5))
     away_xg = max(0.2, min(away_xg, 4.0))
 
-    # Step 6: Poisson probabilities
+    # ── Poisson probability matrix ───────────────────────────────────────
     hw, dr, aw = 0.0, 0.0, 0.0
     score_probs = {}
     for hg in range(9):
@@ -343,30 +439,55 @@ def predict_match(home_team, away_team, stats, streaks):
             if hg > ag: hw += p
             elif hg == ag: dr += p
             else: aw += p
-
     total = hw + dr + aw
     if total > 0: hw /= total; dr /= total; aw /= total
 
-    # Step 7: Over/Under & BTTS
-    o25 = sum(p for (hg, ag), p in score_probs.items() if hg + ag >= 3)
-    btts = sum(p for (hg, ag), p in score_probs.items() if hg >= 1 and ag >= 1)
-    hist_btts = (hs["btts_rate"] + aws["btts_rate"]) / 2
-    hist_o25 = (hs["over25_rate"] + aws["over25_rate"]) / 2
-    btts = btts * 0.6 + hist_btts * 0.4
-    o25 = o25 * 0.6 + hist_o25 * 0.4
+    # ── Blend with ELO probabilities (30% ELO, 70% Poisson) ─────────────
+    elo_hw = elo_win_probability(home_elo, away_elo)
+    elo_aw = 1.0 - elo_win_probability(away_elo, home_elo, home_advantage=0)
+    elo_dr = 1.0 - elo_hw - (1.0 - elo_aw)
+    elo_dr = max(0.15, min(elo_dr, 0.35))  # clamp draw
+    elo_aw_adj = 1.0 - elo_hw - elo_dr
+    
+    hw = hw * 0.70 + elo_hw * 0.30
+    aw = aw * 0.70 + max(elo_aw_adj, 0.05) * 0.30
+    dr = 1.0 - hw - aw
+    dr = max(dr, 0.08)  # floor draw probability
+    # Re-normalise
+    t = hw + dr + aw
+    hw /= t; dr /= t; aw /= t
 
-    # Step 8: Most likely score
+    # ── Over 1.5, BTTS, Double Chance ────────────────────────────────────
+    o15_poisson = sum(p for (hg, ag), p in score_probs.items() if hg + ag >= 2)
+    btts_poisson = sum(p for (hg, ag), p in score_probs.items() if hg >= 1 and ag >= 1)
+    o25_poisson = sum(p for (hg, ag), p in score_probs.items() if hg + ag >= 3)
+
+    hist_btts = (hs["btts_rate"] + aws["btts_rate"]) / 2
+    hist_o15 = (hs["over15_rate"] + aws["over15_rate"]) / 2
+    hist_o25 = (hs["over25_rate"] + aws["over25_rate"]) / 2
+
+    o15 = o15_poisson * 0.6 + hist_o15 * 0.4
+    btts = btts_poisson * 0.6 + hist_btts * 0.4
+    o25 = o25_poisson * 0.6 + hist_o25 * 0.4
+
+    # Double chance (1X = home or draw, X2 = draw or away)
+    dc_home = hw + dr  # 1X
+    dc_away = dr + aw  # X2
+
+    # Most likely score
     best_score = max(score_probs, key=score_probs.get)
 
-    # Step 9: Confidence
+    # ── Confidence score ─────────────────────────────────────────────────
     max_prob = max(hw, dr, aw)
     data_q = min(min(hs["matches_played"], aws["matches_played"]) / 15, 1.0)
-    conf_score = min(max_prob * 0.6 + data_q * 0.25 + abs(form_diff) * 0.15, 1.0)
-    if conf_score >= 0.7: conf = "\U0001f7e2 High"
-    elif conf_score >= 0.5: conf = "\U0001f7e1 Medium"
+    elo_agreement = 1.0 if (elo_hw > 0.5 and hw > aw) or (elo_hw < 0.5 and aw > hw) else 0.5
+    conf_score = min(max_prob * 0.45 + data_q * 0.20 + abs(form_diff) * 0.10 + elo_agreement * 0.25, 1.0)
+    
+    if conf_score >= 0.72: conf = "\U0001f7e2 High"
+    elif conf_score >= 0.52: conf = "\U0001f7e1 Medium"
     else: conf = "\u26aa Low"
 
-    # Step 10: Prediction text
+    # ── Prediction text ──────────────────────────────────────────────────
     if hw > aw and hw > dr:
         pred = f"\U0001f3e0 {home_team} Win" if hw >= 0.55 else f"\U0001f3e0 {home_team} Slight Edge"
     elif aw > hw and aw > dr:
@@ -374,19 +495,29 @@ def predict_match(home_team, away_team, stats, streaks):
     else:
         pred = "\U0001f91d Draw Likely"
 
+    # Key factors
     factors = []
-    if hstreak.get("win_streak", 0) >= 3: factors.append(f"\U0001f525 {home_team} on {hstreak['win_streak']}-game win streak")
-    if astreak.get("win_streak", 0) >= 3: factors.append(f"\U0001f525 {away_team} on {astreak['win_streak']}-game win streak")
+    if abs(home_elo - away_elo) > 100:
+        stronger = home_team if home_elo > away_elo else away_team
+        diff = abs(int(home_elo - away_elo))
+        factors.append(f"\U0001f4ca ELO: {stronger} rated +{diff} higher")
+    if abs(home_pos - away_pos) >= 5:
+        higher = home_team if home_pos < away_pos else away_team
+        factors.append(f"\U0001f3c6 {higher} significantly higher in table")
+    if hsk.get("win_streak", 0) >= 3: factors.append(f"\U0001f525 {home_team} on {hsk['win_streak']}-game win streak")
+    if ask.get("win_streak", 0) >= 3: factors.append(f"\U0001f525 {away_team} on {ask['win_streak']}-game win streak")
     if hs["form_rating"] > 0.7: factors.append(f"\U0001f4c8 {home_team} in excellent form")
     if aws["form_rating"] > 0.7: factors.append(f"\U0001f4c8 {away_team} in excellent form")
     if hs["form_rating"] < 0.3: factors.append(f"\U0001f4c9 {home_team} in poor form")
     if aws["form_rating"] < 0.3: factors.append(f"\U0001f4c9 {away_team} in poor form")
-    if o25 >= 0.65: factors.append("\u26a1 High-scoring match expected")
+    if gd_mom_home > 3: factors.append(f"\u2b06\ufe0f {home_team} GD improving sharply")
+    if gd_mom_away > 3: factors.append(f"\u2b06\ufe0f {away_team} GD improving sharply")
+    if o15 >= 0.80: factors.append("\u26a1 Goals very likely (O1.5)")
     if btts >= 0.65: factors.append("\u26bd Both teams likely to score")
-    if hstreak.get("clean_sheet_streak", 0) >= 3: factors.append(f"\U0001f9e4 {home_team} {hstreak['clean_sheet_streak']} clean sheets in a row")
+    if hsk.get("clean_sheet_streak", 0) >= 3: factors.append(f"\U0001f9e4 {home_team} {hsk['clean_sheet_streak']} clean sheets running")
     if len(h2h_results) >= 3:
         h2hw = h2h_results.count("W")
-        if h2hw >= len(h2h_results) * 0.6: factors.append(f"\U0001f4ca {home_team} dominates H2H ({h2hw}/{len(h2h_results)} wins)")
+        if h2hw >= len(h2h_results) * 0.6: factors.append(f"\U0001f4ca {home_team} dominates H2H ({h2hw}/{len(h2h_results)})")
 
     txg = home_xg + away_xg
     if txg >= 3.5: gp = "High scoring (3+ goals expected)"
@@ -398,11 +529,15 @@ def predict_match(home_team, away_team, stats, streaks):
         "home_team": home_team, "away_team": away_team,
         "home_xg": round(home_xg, 2), "away_xg": round(away_xg, 2),
         "home_win": round(hw, 3), "draw": round(dr, 3), "away_win": round(aw, 3),
-        "over25": round(o25, 3), "btts": round(btts, 3),
+        "over15": round(o15, 3), "over25": round(o25, 3), "btts": round(btts, 3),
+        "double_home": round(dc_home, 3), "double_away": round(dc_away, 3),
         "confidence": conf, "confidence_score": round(conf_score, 3),
         "prediction": pred, "goals_prediction": gp,
-        "factors": factors[:4], "score_line": f"{best_score[0]} - {best_score[1]}",
-        "home_form": hstreak.get("form", ""), "away_form": astreak.get("form", ""),
+        "factors": factors[:5], "score_line": f"{best_score[0]} - {best_score[1]}",
+        "home_form": hsk.get("form", ""), "away_form": ask.get("form", ""),
+        "home_elo": int(home_elo), "away_elo": int(away_elo),
+        "home_pos": home_pos if standings_map else "?",
+        "away_pos": away_pos if standings_map else "?",
     }
 
 
@@ -411,17 +546,21 @@ def predict_match(home_team, away_team, stats, streaks):
 def format_prediction(pred):
     lines = [
         f"\u26bd *{pred['home_team']}* vs *{pred['away_team']}*",
+        f"   \U0001f4ca ELO: {pred['home_elo']} vs {pred['away_elo']} | Pos: {pred['home_pos']} vs {pred['away_pos']}",
         f"",
         f"\U0001f3af *Prediction:* {pred['prediction']}",
         f"\U0001f4ca Most likely score: *{pred['score_line']}*",
         f"",
-        f"\U0001f4c8 *Probabilities:*",
+        f"\U0001f4c8 *Win Probabilities:*",
         f"   \U0001f3e0 Home: {pred['home_win']:.0%}  \U0001f91d Draw: {pred['draw']:.0%}  \u2708\ufe0f Away: {pred['away_win']:.0%}",
         f"",
         f"\u26bd *Goals:*",
         f"   xG: {pred['home_team'][:3].upper()} {pred['home_xg']} - {pred['away_xg']} {pred['away_team'][:3].upper()}",
-        f"   Over 2.5: {pred['over25']:.0%} | BTTS: {pred['btts']:.0%}",
+        f"   Over 1.5: {pred['over15']:.0%} | BTTS: {pred['btts']:.0%}",
         f"   \U0001f4cb {pred['goals_prediction']}",
+        f"",
+        f"\U0001f91d *Double Chance:*",
+        f"   1X (Home/Draw): {pred['double_home']:.0%} | X2 (Draw/Away): {pred['double_away']:.0%}",
     ]
     if pred.get("home_form") or pred.get("away_form"):
         lines.append(f"")
@@ -446,13 +585,16 @@ def format_tip(pred, rank):
         f"   \U0001f3af {pred['prediction']}",
         f"   \U0001f4ca Score: {pred['score_line']} | xG: {pred['home_xg']} - {pred['away_xg']}",
         f"   \U0001f3e0 {pred['home_win']:.0%} | \U0001f91d {pred['draw']:.0%} | \u2708\ufe0f {pred['away_win']:.0%}",
+        f"   ELO: {pred['home_elo']} vs {pred['away_elo']}",
     ]
     angles = []
-    if pred["over25"] >= 0.60: angles.append(f"Over 2.5 ({pred['over25']:.0%})")
+    if pred["over15"] >= 0.75: angles.append(f"Over 1.5 ({pred['over15']:.0%})")
     if pred["btts"] >= 0.60: angles.append(f"BTTS ({pred['btts']:.0%})")
     if pred["home_win"] >= 0.55: angles.append(f"Home Win ({pred['home_win']:.0%})")
     if pred["away_win"] >= 0.55: angles.append(f"Away Win ({pred['away_win']:.0%})")
-    if angles: lines.append(f"   \U0001f4b0 Best angles: {' | '.join(angles)}")
+    if pred["double_home"] >= 0.75: angles.append(f"1X ({pred['double_home']:.0%})")
+    if pred["double_away"] >= 0.75: angles.append(f"X2 ({pred['double_away']:.0%})")
+    if angles: lines.append(f"   \U0001f4b0 Best angles: {' | '.join(angles[:3])}")
     lines.append(f"   Confidence: {pred['confidence']}")
     return "\n".join(lines)
 
@@ -502,88 +644,70 @@ def format_full_report(streaks, league_name):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "\u26bd *Football Streak Tracker & Predictor* \u26bd\n\n"
-        "I track streaks, analyse form, and use statistical modelling "
-        "to predict match outcomes.\n\n"
+        "\u26bd *Football Streak Tracker & AI Predictor v2* \u26bd\n\n"
+        "Track streaks and get data-driven match predictions.\n\n"
         "*\U0001f4ca Streak Commands:*\n"
         "/streaks \u2014 Top winning streaks\n"
         "/goals \u2014 Top goal-scoring streaks\n"
-        "/league \u2014 Pick a league for detailed streaks\n"
+        "/league \u2014 Detailed league streaks\n"
         "/today \u2014 Today's matches\n\n"
-        "*\U0001f916 Prediction Commands:*\n"
-        "/predict \u2014 AI predictions for today's matches\n"
-        "/tips \u2014 Best picks of the day (highest confidence)\n\n"
+        "*\U0001f916 AI Prediction Commands:*\n"
+        "/predict \u2014 Full predictions for today\n"
+        "/tips \u2014 Best picks (highest confidence)\n\n"
         "/help \u2014 Show this message\n\n"
-        "\U0001f9e0 _Predictions use Poisson modelling, form weighting,_\n"
-        "_streak momentum, and head-to-head analysis_\n\n"
-        "\u26a0\ufe0f _Predictions are statistical estimates, not guarantees._\n"
-        "_Please gamble responsibly._"
+        "\U0001f9e0 *Prediction Model (6 layers):*\n"
+        "1\ufe0f\u20e3 Poisson goal model (attack/defense strength)\n"
+        "2\ufe0f\u20e3 ELO rating system (dynamic team strength)\n"
+        "3\ufe0f\u20e3 League position weighting\n"
+        "4\ufe0f\u20e3 Form analysis (exponential decay)\n"
+        "5\ufe0f\u20e3 Streak momentum + GD trajectory\n"
+        "6\ufe0f\u20e3 Head-to-head historical record\n\n"
+        "\u26a0\ufe0f _Statistical estimates, not guarantees. Gamble responsibly._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
-
 async def cmd_streaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "\U0001f504 Fetching streak data (league matches only)...\n_(This may take ~60 seconds)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    date_from = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
-    all_messages = []
+    await update.message.reply_text("\U0001f504 Fetching streak data...\n_(~60 seconds)_", parse_mode=ParseMode.MARKDOWN)
+    df = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
+    msgs = []
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
         try:
             if i > 0: await asyncio.sleep(6)
-            matches = await api.get_matches(code, date_from, date_to)
+            matches = await api.get_matches(code, df, dt)
             if not matches: continue
-            streaks = calculate_streaks(matches)
-            msg = format_winning_streaks(streaks, f"{info['flag']} {info['name']}", top_n=5)
-            all_messages.append(msg)
-        except Exception as e:
-            logger.error(f"Error fetching {code}: {e}")
-    if all_messages:
-        full = "\n\n".join(all_messages)
+            msgs.append(format_winning_streaks(calculate_streaks(matches), f"{info['flag']} {info['name']}", top_n=5))
+        except Exception as e: logger.error(f"Error {code}: {e}")
+    if msgs:
+        full = "\n\n".join(msgs)
         if len(full) > 4000:
-            for msg in all_messages:
-                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("\u274c Could not fetch streak data.")
-
+            for m in msgs: await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
+        else: await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
+    else: await update.message.reply_text("\u274c Could not fetch streak data.")
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "\U0001f504 Fetching goal streaks (league matches only)...\n_(This may take ~60 seconds)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    date_from = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
-    all_messages = []
+    await update.message.reply_text("\U0001f504 Fetching goal streaks...\n_(~60 seconds)_", parse_mode=ParseMode.MARKDOWN)
+    df = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
+    msgs = []
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
         try:
             if i > 0: await asyncio.sleep(6)
-            matches = await api.get_matches(code, date_from, date_to)
+            matches = await api.get_matches(code, df, dt)
             if not matches: continue
-            streaks = calculate_streaks(matches)
-            msg = format_goal_streaks(streaks, f"{info['flag']} {info['name']}", top_n=5)
-            all_messages.append(msg)
-        except Exception as e:
-            logger.error(f"Error fetching {code}: {e}")
-    if all_messages:
-        full = "\n\n".join(all_messages)
+            msgs.append(format_goal_streaks(calculate_streaks(matches), f"{info['flag']} {info['name']}", top_n=5))
+        except Exception as e: logger.error(f"Error {code}: {e}")
+    if msgs:
+        full = "\n\n".join(msgs)
         if len(full) > 4000:
-            for msg in all_messages: await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("\u274c Could not fetch goal streak data.")
-
+            for m in msgs: await update.message.reply_text(m, parse_mode=ParseMode.MARKDOWN)
+        else: await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
+    else: await update.message.reply_text("\u274c Could not fetch goal streak data.")
 
 async def cmd_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -599,7 +723,6 @@ async def cmd_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("\U0001f3df\ufe0f *Select a region or league:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
-
 REGION_MENUS = {
     "england": {"title": "English Leagues", "leagues": ["PL", "ELC"]},
     "spain": {"title": "Spanish Leagues", "leagues": ["PD", "SD"]},
@@ -611,25 +734,21 @@ REGION_MENUS = {
     "more": {"title": "More Leagues", "leagues": ["MLS", "ASL", "JPL", "LMX", "JPB", "SPL", "DSL", "SSL", "TSL", "GSL"]},
 }
 
-
 async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    query = update.callback_query; await query.answer()
     region = REGION_MENUS.get(query.data.replace("region_", ""))
     if not region: await query.edit_message_text("\u274c Unknown region."); return
-    keyboard = []
+    kb = []
     for code in region["leagues"]:
         info = LEAGUES.get(code)
         if not info: continue
         tier = "\U0001f193" if code in FREE_LEAGUES else "\U0001f4b0"
-        keyboard.append([InlineKeyboardButton(f"{info['flag']} {info['name']} {tier}", callback_data=f"league_{code}")])
-    keyboard.append([InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="back_to_regions")])
-    await query.edit_message_text(f"*{region['title']}*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-
+        kb.append([InlineKeyboardButton(f"{info['flag']} {info['name']} {tier}", callback_data=f"league_{code}")])
+    kb.append([InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="back_to_regions")])
+    await query.edit_message_text(f"*{region['title']}*", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
 async def back_to_regions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    query = update.callback_query; await query.answer()
     keyboard = [
         [InlineKeyboardButton("\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f England", callback_data="region_england")],
         [InlineKeyboardButton("\U0001f1ea\U0001f1f8 Spain", callback_data="region_spain")],
@@ -643,129 +762,147 @@ async def back_to_regions_callback(update: Update, context: ContextTypes.DEFAULT
     ]
     await query.edit_message_text("\U0001f3df\ufe0f *Select a region or league:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
-
 async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    query = update.callback_query; await query.answer()
     code = query.data.replace("league_", "")
     info = LEAGUES.get(code)
     if not info: await query.edit_message_text("\u274c Unknown league."); return
     is_paid = code in PAID_LEAGUES
     await query.edit_message_text(f"\U0001f504 Fetching {info['name']} streak data...")
-    date_from = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
+    df = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
     try:
-        matches = await api.get_matches(code, date_from, date_to)
+        matches = await api.get_matches(code, df, dt)
         if not matches: await query.edit_message_text(f"No recent matches for {info['name']}."); return
-        streaks = calculate_streaks(matches)
-        await query.edit_message_text(format_full_report(streaks, f"{info['flag']} {info['name']}"), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(format_full_report(calculate_streaks(matches), f"{info['flag']} {info['name']}"), parse_mode=ParseMode.MARKDOWN)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403 and is_paid:
-            await query.edit_message_text(f"\U0001f512 *{info['name']}* requires a paid subscription.\nUpgrade at: https://www.football-data.org/pricing", parse_mode=ParseMode.MARKDOWN)
+            await query.edit_message_text(f"\U0001f512 *{info['name']}* requires a paid subscription.\nhttps://www.football-data.org/pricing", parse_mode=ParseMode.MARKDOWN)
         elif e.response.status_code == 429:
-            await query.edit_message_text("\u23f1\ufe0f Rate limit hit. Wait a minute and try again.")
-        else:
-            await query.edit_message_text(f"\u274c API error: {e}")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await query.edit_message_text(f"\u274c Error: {e}")
-
+            await query.edit_message_text("\u23f1\ufe0f Rate limit hit. Wait a minute.")
+        else: await query.edit_message_text(f"\u274c API error: {e}")
+    except Exception as e: logger.error(f"Error: {e}"); await query.edit_message_text(f"\u274c Error: {e}")
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\U0001f504 Checking today's fixtures...")
-    all_lines = ["\U0001f4c5 *Today's Matches*\n"]
-    found_any = False
+    lines = ["\U0001f4c5 *Today's Matches*\n"]
+    found = False
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
         try:
             if i > 0: await asyncio.sleep(6)
             matches = await api.get_todays_matches(code)
             if not matches: continue
-            found_any = True
-            all_lines.append(f"\n{info['flag']} *{info['name']}*")
+            found = True
+            lines.append(f"\n{info['flag']} *{info['name']}*")
             for m in matches:
-                home = m["homeTeam"]["name"]
-                away = m["awayTeam"]["name"]
-                status = m["status"]
+                home, away, status = m["homeTeam"]["name"], m["awayTeam"]["name"], m["status"]
                 if status == "FINISHED":
-                    all_lines.append(f"  \u2705 {home} {m['score']['fullTime']['home']} - {m['score']['fullTime']['away']} {away}")
+                    lines.append(f"  \u2705 {home} {m['score']['fullTime']['home']} - {m['score']['fullTime']['away']} {away}")
                 elif status in ("IN_PLAY", "PAUSED"):
-                    all_lines.append(f"  \U0001f534 {home} {m['score']['fullTime']['home'] or 0} - {m['score']['fullTime']['away'] or 0} {away} (LIVE)")
+                    lines.append(f"  \U0001f534 {home} {m['score']['fullTime']['home'] or 0} - {m['score']['fullTime']['away'] or 0} {away} (LIVE)")
                 else:
                     ts = m.get("utcDate", "")
                     ko = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M UTC") if ts else "TBD"
-                    all_lines.append(f"  \U0001f550 {home} vs {away} ({ko})")
-        except Exception as e:
-            logger.error(f"Error today {code}: {e}")
-    if not found_any: all_lines.append("\nNo matches today.")
-    await update.message.reply_text("\n".join(all_lines), parse_mode=ParseMode.MARKDOWN)
+                    lines.append(f"  \U0001f550 {home} vs {away} ({ko})")
+        except Exception as e: logger.error(f"Error today {code}: {e}")
+    if not found: lines.append("\nNo matches today.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PREDICTION COMMAND HANDLERS
+# PREDICTION HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def _fetch_league_predictions(code, info, date_from, date_to):
+    """Fetch data and generate predictions for one league. Returns list of predictions."""
+    predictions = []
+    try:
+        today_matches = await api.get_todays_matches(code)
+        upcoming = [m for m in today_matches if m["status"] in ("SCHEDULED", "TIMED")]
+        if not upcoming:
+            return predictions
+
+        await asyncio.sleep(7)
+        historical = await api.get_matches(code, date_from, date_to)
+        if not historical:
+            return predictions
+
+        # Build all prediction layers
+        team_stats = build_team_stats(historical)
+        stks = calculate_streaks(historical)
+        elo_ratings = calculate_elo_ratings(historical)
+
+        # Try to get standings (extra API call)
+        standings_map = {}
+        try:
+            await asyncio.sleep(7)
+            standings = await api.get_standings(code)
+            for entry in standings:
+                team_name = entry.get("team", {}).get("name", "")
+                position = entry.get("position", 99)
+                if team_name:
+                    standings_map[team_name] = position
+        except Exception:
+            pass  # standings are optional
+
+        for match in upcoming:
+            home = match["homeTeam"]["name"]
+            away = match["awayTeam"]["name"]
+            ts = match.get("utcDate", "")
+            ko = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M UTC") if ts else ""
+            pred = predict_match(home, away, team_stats, stks, elo_ratings, standings_map)
+            pred["league"] = f"{info['flag']} {info['name']}"
+            pred["kick_off"] = ko
+            predictions.append(pred)
+    except Exception as e:
+        logger.error(f"Prediction error {code}: {e}")
+    return predictions
+
 
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001f916 *Generating predictions...*\n"
-        "_(Analysing form, streaks, attack/defense ratings & H2H)_\n"
-        "_(This may take ~90 seconds due to API rate limits)_",
+        "\U0001f916 *Generating AI predictions...*\n"
+        "_(ELO ratings + Poisson model + form + league position + streaks + H2H)_\n"
+        "_(This may take ~2 minutes due to API rate limits)_",
         parse_mode=ParseMode.MARKDOWN,
     )
-    date_from = (datetime.utcnow() - timedelta(days=120)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
+    df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    all_predictions = []
+    all_preds = []
     req = 0
 
     for code, info in FREE_LEAGUES.items():
         if info.get("type") == "CUP": continue
-        try:
-            if req > 0: await asyncio.sleep(7)
-            today_matches = await api.get_todays_matches(code)
-            req += 1
-            upcoming = [m for m in today_matches if m["status"] in ("SCHEDULED", "TIMED")]
-            if not upcoming: continue
+        if req > 0: await asyncio.sleep(7)
+        preds = await _fetch_league_predictions(code, info, df, dt)
+        all_preds.extend(preds)
+        req += 1
 
-            await asyncio.sleep(7)
-            historical = await api.get_matches(code, date_from, date_to)
-            req += 1
-            if not historical: continue
-
-            team_stats = build_team_stats(historical)
-            stks = calculate_streaks(historical)
-
-            for match in upcoming:
-                home = match["homeTeam"]["name"]
-                away = match["awayTeam"]["name"]
-                ts = match.get("utcDate", "")
-                ko = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M UTC") if ts else ""
-                pred = predict_match(home, away, team_stats, stks)
-                pred["league"] = f"{info['flag']} {info['name']}"
-                pred["kick_off"] = ko
-                all_predictions.append(pred)
-        except Exception as e:
-            logger.error(f"Prediction error {code}: {e}")
-
-    if not all_predictions:
+    if not all_preds:
         await update.message.reply_text("\u274c No upcoming matches found today.\nTry again on a match day.")
         return
 
-    header = f"\U0001f916 *AI Match Predictions \u2014 {today}*\n\U0001f4ca _Poisson model + form + streaks + H2H_\n{'=' * 30}\n"
+    header = (
+        f"\U0001f916 *AI Match Predictions \u2014 {today}*\n"
+        f"\U0001f4ca _6-layer model: Poisson + ELO + Position + Form + Streaks + H2H_\n"
+        f"{'=' * 30}\n"
+    )
     current_league = ""
     current_msg = header
 
-    for pred in all_predictions:
-        league_hdr = ""
+    for pred in all_preds:
+        lhdr = ""
         if pred["league"] != current_league:
             current_league = pred["league"]
-            league_hdr = f"\n\U0001f3df\ufe0f *{current_league}*\n"
-        pred_text = league_hdr + format_prediction(pred)
-        if len(current_msg) + len(pred_text) > 3800:
+            lhdr = f"\n\U0001f3df\ufe0f *{current_league}*\n"
+        pt = lhdr + format_prediction(pred)
+        if len(current_msg) + len(pt) > 3800:
             await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN)
-            current_msg = pred_text
+            current_msg = pt
         else:
-            current_msg += "\n" + pred_text
+            current_msg += "\n" + pt
 
     if current_msg:
         current_msg += "\n\n\u26a0\ufe0f _Statistical estimates only. Not guarantees. Gamble responsibly._"
@@ -774,67 +911,47 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001f52e *Finding best picks...*\n_(Scanning all leagues for high-confidence predictions)_\n_(~90 seconds)_",
+        "\U0001f52e *Finding best picks...*\n_(Scanning all leagues)_\n_(~2 minutes)_",
         parse_mode=ParseMode.MARKDOWN,
     )
-    date_from = (datetime.utcnow() - timedelta(days=120)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
+    df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    all_predictions = []
+    all_preds = []
     req = 0
 
     for code, info in FREE_LEAGUES.items():
         if info.get("type") == "CUP": continue
-        try:
-            if req > 0: await asyncio.sleep(7)
-            today_matches = await api.get_todays_matches(code)
-            req += 1
-            upcoming = [m for m in today_matches if m["status"] in ("SCHEDULED", "TIMED")]
-            if not upcoming: continue
+        if req > 0: await asyncio.sleep(7)
+        preds = await _fetch_league_predictions(code, info, df, dt)
+        all_preds.extend(preds)
+        req += 1
 
-            await asyncio.sleep(7)
-            historical = await api.get_matches(code, date_from, date_to)
-            req += 1
-            if not historical: continue
-
-            team_stats = build_team_stats(historical)
-            stks = calculate_streaks(historical)
-
-            for match in upcoming:
-                home = match["homeTeam"]["name"]
-                away = match["awayTeam"]["name"]
-                ts = match.get("utcDate", "")
-                ko = datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%H:%M UTC") if ts else ""
-                pred = predict_match(home, away, team_stats, stks)
-                pred["league"] = f"{info['flag']} {info['name']}"
-                pred["kick_off"] = ko
-                all_predictions.append(pred)
-        except Exception as e:
-            logger.error(f"Tips error {code}: {e}")
-
-    if not all_predictions:
+    if not all_preds:
         await update.message.reply_text("\u274c No upcoming matches today.\nTry again on a match day.")
         return
 
-    all_predictions.sort(key=lambda x: x["confidence_score"], reverse=True)
-    top = all_predictions[:8]
+    all_preds.sort(key=lambda x: x["confidence_score"], reverse=True)
+    top = all_preds[:8]
 
-    lines = [f"\U0001f52e *Top Picks \u2014 {today}*", "_Ranked by prediction confidence_", "=" * 30, ""]
+    lines = [f"\U0001f52e *Top Picks \u2014 {today}*", "_Ranked by AI confidence_", "=" * 30, ""]
     for i, pred in enumerate(top):
         lines.append(f"*{pred['league']}* ({pred['kick_off']})")
         lines.append(format_tip(pred, i))
         lines.append("")
 
-    high_conf = [p for p in all_predictions if p["confidence_score"] >= 0.7]
-    o25_picks = [p for p in all_predictions if p["over25"] >= 0.65]
-    btts_picks = [p for p in all_predictions if p["btts"] >= 0.65]
+    hc = [p for p in all_preds if p["confidence_score"] >= 0.72]
+    o15p = [p for p in all_preds if p["over15"] >= 0.80]
+    btts_p = [p for p in all_preds if p["btts"] >= 0.65]
+    dc_p = [p for p in all_preds if p["double_home"] >= 0.80 or p["double_away"] >= 0.80]
 
     lines.append("=" * 30)
     lines.append(f"\U0001f4ca *Today's Summary:*")
-    lines.append(f"   {len(all_predictions)} matches analysed")
-    lines.append(f"   \U0001f7e2 {len(high_conf)} high-confidence picks")
-    lines.append(f"   \u26bd {len(o25_picks)} likely Over 2.5")
-    lines.append(f"   \U0001f3af {len(btts_picks)} likely BTTS")
+    lines.append(f"   {len(all_preds)} matches analysed")
+    lines.append(f"   \U0001f7e2 {len(hc)} high-confidence picks")
+    lines.append(f"   \u26bd {len(o15p)} strong Over 1.5")
+    lines.append(f"   \U0001f3af {len(btts_p)} likely BTTS")
+    lines.append(f"   \U0001f91d {len(dc_p)} strong Double Chance")
     lines.append(f"")
     lines.append(f"\u26a0\ufe0f _Statistical estimates only. Gamble responsibly._")
 
@@ -852,7 +969,7 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg2.append(f"*{pred['league']}* ({pred['kick_off']})")
             msg2.append(format_tip(pred, i + mid))
             msg2.append("")
-        msg2.extend(lines[-7:])
+        msg2.extend(lines[-8:])
         await update.message.reply_text("\n".join(msg2), parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -861,18 +978,17 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
     chat_id = os.environ.get("DAILY_CHAT_ID")
     if not chat_id: return
-    date_from = (datetime.utcnow() - timedelta(days=120)).strftime("%Y-%m-%d")
-    date_to = datetime.utcnow().strftime("%Y-%m-%d")
+    df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
     today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    summary = [f"\U0001f305 *Daily Streak & Prediction Summary \u2014 {today}*\n"]
+    summary = [f"\U0001f305 *Daily Streak & AI Prediction Summary \u2014 {today}*\n"]
     all_preds = []
 
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
         try:
             if i > 0: await asyncio.sleep(7)
-            historical = await api.get_matches(code, date_from, date_to)
+            historical = await api.get_matches(code, df, dt)
             if not historical: continue
             stks = calculate_streaks(historical)
             notable = {t: d for t, d in stks.items() if d["win_streak"] >= 3 or d["goal_streak"] >= 5}
@@ -885,24 +1001,17 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
                     summary.append(f"  {t}: {' | '.join(parts)} {d['form']}")
 
             await asyncio.sleep(7)
-            today_m = await api.get_todays_matches(code)
-            upcoming = [m for m in today_m if m["status"] in ("SCHEDULED", "TIMED")]
-            if upcoming and historical:
-                ts = build_team_stats(historical)
-                for m in upcoming:
-                    pred = predict_match(m["homeTeam"]["name"], m["awayTeam"]["name"], ts, stks)
-                    pred["league"] = f"{info['flag']} {info['name']}"
-                    all_preds.append(pred)
-        except Exception as e:
-            logger.error(f"Daily summary error {code}: {e}")
+            preds = await _fetch_league_predictions(code, info, df, dt)
+            all_preds.extend(preds)
+        except Exception as e: logger.error(f"Daily error {code}: {e}")
 
     if all_preds:
         all_preds.sort(key=lambda x: x["confidence_score"], reverse=True)
         summary.append(f"\n{'=' * 25}")
-        summary.append(f"\U0001f52e *Top Predictions Today:*")
+        summary.append(f"\U0001f52e *Top Predictions:*")
         for pred in all_preds[:5]:
             mp = max(pred["home_win"], pred["draw"], pred["away_win"])
-            summary.append(f"  {pred['home_team']} vs {pred['away_team']}\n    \U0001f3af {pred['prediction']} ({mp:.0%})\n    \U0001f4ca xG: {pred['home_xg']} - {pred['away_xg']}")
+            summary.append(f"  {pred['home_team']} vs {pred['away_team']}\n    \U0001f3af {pred['prediction']} ({mp:.0%})\n    ELO: {pred['home_elo']} vs {pred['away_elo']} | xG: {pred['home_xg']}-{pred['away_xg']}")
 
     if len(summary) > 1:
         summary.append(f"\n\u26a0\ufe0f _Statistical estimates only._")
@@ -911,14 +1020,11 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        print("\u26a0\ufe0f  Set TELEGRAM_BOT_TOKEN environment variable!")
-        return
+        print("\u26a0\ufe0f  Set TELEGRAM_BOT_TOKEN!"); return
     if FOOTBALL_API_KEY == "YOUR_FOOTBALL_DATA_API_KEY":
-        print("\u26a0\ufe0f  Set FOOTBALL_API_KEY environment variable!")
-        return
+        print("\u26a0\ufe0f  Set FOOTBALL_API_KEY!"); return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("streaks", cmd_streaks))
@@ -927,20 +1033,18 @@ def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("tips", cmd_tips))
-
     app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league_"))
     app.add_handler(CallbackQueryHandler(region_callback, pattern=r"^region_"))
     app.add_handler(CallbackQueryHandler(back_to_regions_callback, pattern=r"^back_to_regions$"))
 
-    job_queue = app.job_queue
-    if job_queue and os.environ.get("DAILY_CHAT_ID"):
+    jq = app.job_queue
+    if jq and os.environ.get("DAILY_CHAT_ID"):
         from datetime import time as dt_time
-        job_queue.run_daily(daily_summary, time=dt_time(hour=8, minute=0), name="daily_streak_summary")
+        jq.run_daily(daily_summary, time=dt_time(hour=8, minute=0), name="daily_summary")
         logger.info("Daily summary scheduled for 08:00 UTC")
 
-    print("\U0001f916 Football Streak Tracker & Predictor is running!")
+    print("\U0001f916 Football Streak Tracker & AI Predictor v2 is running!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
