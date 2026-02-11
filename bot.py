@@ -1,13 +1,9 @@
 """
-Football Streak Tracker & AI Predictor — Telegram Bot v2
+Football Streak Tracker & AI Predictor — Telegram Bot v3
 =========================================================
 Uses ELO ratings, Poisson modelling, form weighting, league position,
-streak momentum, and head-to-head analysis to predict match outcomes.
-
-Inspired by:
-  - ProphitBet (feature engineering, ensemble approach)
-  - jkrusina/SoccerPredictor (time-series, double chance)
-  - ronyka77/SoccerPredictor (ELO ratings, stacked models, Poisson xG)
+streak momentum, head-to-head analysis, and bookmaker odds comparison
+to predict match outcomes and find value bets.
 
 Commands:
   /start, /help   - Welcome & instructions
@@ -17,11 +13,14 @@ Commands:
   /today           - Today's matches
   /predict         - AI predictions for today's matches
   /tips            - Best picks of the day (highest confidence)
+  /results         - Yesterday's prediction accuracy report
+  /value           - Value bets (edge over bookmakers)
 """
 
-import os, logging, asyncio, math
+import os, logging, asyncio, math, json
 from datetime import datetime, timedelta
 from collections import defaultdict
+from pathlib import Path
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,7 +29,28 @@ from telegram.constants import ParseMode
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "YOUR_FOOTBALL_DATA_API_KEY")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")  # Free at the-odds-api.com (500 req/month)
 FOOTBALL_API_BASE = "https://api.football-data.org/v4"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+# Persistent storage for prediction logs
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/football-bot-data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PREDICTIONS_FILE = DATA_DIR / "predictions_log.json"
+RESULTS_FILE = DATA_DIR / "results_history.json"
+
+# Map our league codes to The Odds API sport keys
+ODDS_LEAGUE_MAP = {
+    "PL": "soccer_epl",
+    "ELC": "soccer_efl_champ",
+    "PD": "soccer_spain_la_liga",
+    "BL1": "soccer_germany_bundesliga",
+    "SA": "soccer_italy_serie_a",
+    "FL1": "soccer_france_ligue_one",
+    "DED": "soccer_netherlands_eredivisie",
+    "PPL": "soccer_portugal_primeira_liga",
+    "BSA": "soccer_brazil_campeonato",
+}
 
 FREE_LEAGUES = {
     "PL": {"name": "Premier League", "flag": "\U0001f3f4\U000e0067\U000e0062\U000e0065\U000e006e\U000e0067\U000e007f", "country": "England", "type": "LEAGUE"},
@@ -105,6 +125,416 @@ class FootballAPI:
         return []
 
 api = FootballAPI(FOOTBALL_API_KEY)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTION LOGGING SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_json(path, default=None):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return default if default is not None else {}
+
+
+def _save_json(path, data):
+    try:
+        path.write_text(json.dumps(data, indent=2, default=str))
+    except Exception as e:
+        logger.error(f"Failed to save {path}: {e}")
+
+
+def save_predictions(predictions, date_str=None):
+    """Save today's predictions for later results checking."""
+    if not predictions:
+        return
+    date_str = date_str or datetime.utcnow().strftime("%Y-%m-%d")
+    log = _load_json(PREDICTIONS_FILE, {})
+
+    entries = []
+    for p in predictions:
+        entries.append({
+            "home": p["home_team"],
+            "away": p["away_team"],
+            "league": p.get("league", ""),
+            "prediction": p.get("prediction", ""),
+            "score_line": p.get("score_line", ""),
+            "over15": p.get("over15", 0),
+            "double_home": p.get("double_home", 0),
+            "double_away": p.get("double_away", 0),
+            "home_win": p.get("home_win", 0),
+            "draw": p.get("draw", 0),
+            "away_win": p.get("away_win", 0),
+            "confidence": p.get("confidence", ""),
+            "value_bets": p.get("value_bets", []),
+        })
+    log[date_str] = entries
+    # Keep last 30 days
+    cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+    log = {k: v for k, v in log.items() if k >= cutoff}
+    _save_json(PREDICTIONS_FILE, log)
+    logger.info(f"Saved {len(entries)} predictions for {date_str}")
+
+
+def save_results_report(date_str, report):
+    """Save a results report to history."""
+    history = _load_json(RESULTS_FILE, {})
+    history[date_str] = report
+    cutoff = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
+    history = {k: v for k, v in history.items() if k >= cutoff}
+    _save_json(RESULTS_FILE, history)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ODDS API INTEGRATION (The Odds API - Free tier: 500 req/month)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_odds(league_code):
+    """Fetch bookmaker odds for a league from The Odds API."""
+    if not ODDS_API_KEY:
+        return {}
+    sport_key = ODDS_LEAGUE_MAP.get(league_code)
+    if not sport_key:
+        return {}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "uk",
+                    "markets": "h2h,totals",
+                    "oddsFormat": "decimal",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.error(f"Odds API error for {league_code}: {e}")
+        return {}
+
+    # Build lookup: (home_team_lower, away_team_lower) -> odds dict
+    odds_map = {}
+    for event in data:
+        home = event.get("home_team", "").lower().strip()
+        away = event.get("away_team", "").lower().strip()
+        if not home or not away:
+            continue
+
+        best_odds = {"home": 0, "draw": 0, "away": 0, "over15": 0, "under15": 0, "over25": 0, "under25": 0}
+        for bm in event.get("bookmakers", []):
+            for market in bm.get("markets", []):
+                if market["key"] == "h2h":
+                    for outcome in market.get("outcomes", []):
+                        name = outcome["name"].lower().strip()
+                        price = outcome.get("price", 0)
+                        if name == home and price > best_odds["home"]:
+                            best_odds["home"] = price
+                        elif name == away and price > best_odds["away"]:
+                            best_odds["away"] = price
+                        elif name == "draw" and price > best_odds["draw"]:
+                            best_odds["draw"] = price
+                elif market["key"] == "totals":
+                    for outcome in market.get("outcomes", []):
+                        point = outcome.get("point", 0)
+                        price = outcome.get("price", 0)
+                        if point == 1.5:
+                            if outcome["name"] == "Over" and price > best_odds["over15"]:
+                                best_odds["over15"] = price
+                            elif outcome["name"] == "Under" and price > best_odds["under15"]:
+                                best_odds["under15"] = price
+                        elif point == 2.5:
+                            if outcome["name"] == "Over" and price > best_odds["over25"]:
+                                best_odds["over25"] = price
+                            elif outcome["name"] == "Under" and price > best_odds["under25"]:
+                                best_odds["under25"] = price
+        odds_map[(home, away)] = best_odds
+    logger.info(f"Fetched odds for {len(odds_map)} matches in {league_code}")
+    return odds_map
+
+
+def _match_odds(odds_map, home_team, away_team):
+    """Fuzzy-match team names to odds map. Returns odds dict or None."""
+    if not odds_map:
+        return None
+    h = home_team.lower().strip()
+    a = away_team.lower().strip()
+    # Exact match
+    if (h, a) in odds_map:
+        return odds_map[(h, a)]
+    # Partial match: check if any key contains our team names
+    for (oh, oa), odds in odds_map.items():
+        h_match = h in oh or oh in h or any(w in oh for w in h.split() if len(w) > 3)
+        a_match = a in oa or oa in a or any(w in oa for w in a.split() if len(w) > 3)
+        if h_match and a_match:
+            return odds
+    return None
+
+
+def calculate_value_bets(pred, odds):
+    """
+    Compare model probability vs bookmaker implied probability.
+    Value = model_prob - implied_prob. Positive = edge for the bettor.
+    """
+    if not odds:
+        return []
+    values = []
+
+    def _implied(decimal_odds):
+        return 1.0 / decimal_odds if decimal_odds > 1.0 else 1.0
+
+    # Over 1.5 goals
+    if odds.get("over15", 0) > 1.0:
+        implied = _implied(odds["over15"])
+        edge = pred["over15"] - implied
+        if edge > 0.05:  # 5%+ edge
+            values.append({
+                "market": "Over 1.5",
+                "our_prob": pred["over15"],
+                "implied_prob": implied,
+                "odds": odds["over15"],
+                "edge": edge,
+            })
+
+    # 1X (Home or Draw) — implied from combining home + draw odds
+    if odds.get("home", 0) > 1.0 and odds.get("draw", 0) > 1.0:
+        imp_home = _implied(odds["home"])
+        imp_draw = _implied(odds["draw"])
+        # Approximate 1X implied: deduct overround proportionally
+        imp_1x = imp_home + imp_draw
+        # Best odds for 1X ≈ 1 / (imp_home + imp_draw) adjusted
+        dc_1x_odds = 1.0 / imp_1x if imp_1x > 0 else 0
+        edge = pred["double_home"] - imp_1x
+        if edge > 0.05 and dc_1x_odds > 1.0:
+            values.append({
+                "market": "1X (Home/Draw)",
+                "our_prob": pred["double_home"],
+                "implied_prob": imp_1x,
+                "odds": round(dc_1x_odds, 2),
+                "edge": edge,
+            })
+
+    # X2 (Draw or Away)
+    if odds.get("away", 0) > 1.0 and odds.get("draw", 0) > 1.0:
+        imp_away = _implied(odds["away"])
+        imp_draw = _implied(odds["draw"])
+        imp_x2 = imp_away + imp_draw
+        dc_x2_odds = 1.0 / imp_x2 if imp_x2 > 0 else 0
+        edge = pred["double_away"] - imp_x2
+        if edge > 0.05 and dc_x2_odds > 1.0:
+            values.append({
+                "market": "X2 (Draw/Away)",
+                "our_prob": pred["double_away"],
+                "implied_prob": imp_x2,
+                "odds": round(dc_x2_odds, 2),
+                "edge": edge,
+            })
+
+    # Sort by edge descending
+    values.sort(key=lambda x: x["edge"], reverse=True)
+    return values
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESULTS TRACKER
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def check_results(target_date=None):
+    """
+    Check actual results against saved predictions for a given date.
+    Returns a report dict with hit rates per market.
+    """
+    if target_date is None:
+        target_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    log = _load_json(PREDICTIONS_FILE, {})
+    preds = log.get(target_date, [])
+    if not preds:
+        return None
+
+    # Fetch actual results for the date
+    actual_results = {}
+    for code, info in FREE_LEAGUES.items():
+        if info.get("type") == "CUP":
+            continue
+        try:
+            data = await api._get(
+                f"/competitions/{code}/matches",
+                {"dateFrom": target_date, "dateTo": target_date, "status": "FINISHED"},
+            )
+            for m in data.get("matches", []):
+                home = m["homeTeam"]["name"]
+                away = m["awayTeam"]["name"]
+                hg = m["score"]["fullTime"]["home"]
+                ag = m["score"]["fullTime"]["away"]
+                if hg is not None and ag is not None:
+                    actual_results[(home, away)] = {"home_goals": hg, "away_goals": ag}
+            await asyncio.sleep(6)
+        except Exception as e:
+            logger.error(f"Results fetch error {code}: {e}")
+
+    if not actual_results:
+        return None
+
+    # Compare predictions to actual results
+    report = {
+        "date": target_date,
+        "total": 0,
+        "matched": 0,  # predictions we found results for
+        "o15_total": 0, "o15_hits": 0,
+        "dc1x_total": 0, "dc1x_hits": 0,
+        "dc_x2_total": 0, "dc_x2_hits": 0,
+        "outcome_total": 0, "outcome_hits": 0,
+        "value_total": 0, "value_hits": 0,
+        "matches": [],
+    }
+
+    for pred in preds:
+        home = pred["home"]
+        away = pred["away"]
+        actual = actual_results.get((home, away))
+        if not actual:
+            continue
+
+        report["matched"] += 1
+        hg = actual["home_goals"]
+        ag = actual["away_goals"]
+        total_goals = hg + ag
+        actual_result = "home" if hg > ag else ("away" if ag > hg else "draw")
+
+        match_report = {
+            "home": home, "away": away,
+            "score": f"{hg}-{ag}",
+            "checks": [],
+        }
+
+        # Over 1.5
+        if pred["over15"] >= 0.60:
+            report["o15_total"] += 1
+            hit = total_goals >= 2
+            if hit: report["o15_hits"] += 1
+            match_report["checks"].append(("O1.5", pred["over15"], hit))
+
+        # 1X Double Chance
+        if pred["double_home"] >= 0.65:
+            report["dc1x_total"] += 1
+            hit = actual_result in ("home", "draw")
+            if hit: report["dc1x_hits"] += 1
+            match_report["checks"].append(("1X", pred["double_home"], hit))
+
+        # X2 Double Chance
+        if pred["double_away"] >= 0.65:
+            report["dc_x2_total"] += 1
+            hit = actual_result in ("away", "draw")
+            if hit: report["dc_x2_hits"] += 1
+            match_report["checks"].append(("X2", pred["double_away"], hit))
+
+        # Outcome (1X2)
+        pred_result = "home" if pred["home_win"] > pred["away_win"] and pred["home_win"] > pred["draw"] else (
+            "away" if pred["away_win"] > pred["home_win"] and pred["away_win"] > pred["draw"] else "draw"
+        )
+        report["outcome_total"] += 1
+        if pred_result == actual_result:
+            report["outcome_hits"] += 1
+
+        # Value bets
+        for vb in pred.get("value_bets", []):
+            report["value_total"] += 1
+            mkt = vb["market"]
+            hit = False
+            if "Over 1.5" in mkt:
+                hit = total_goals >= 2
+            elif "1X" in mkt:
+                hit = actual_result in ("home", "draw")
+            elif "X2" in mkt:
+                hit = actual_result in ("away", "draw")
+            if hit:
+                report["value_hits"] += 1
+
+        report["matches"].append(match_report)
+
+    report["total"] = len(preds)
+    return report
+
+
+def format_results_report(report):
+    """Format results report for Telegram."""
+    if not report:
+        return None
+
+    date = report["date"]
+    matched = report["matched"]
+
+    lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f4ca  *RESULTS TRACKER*",
+        f"  \U0001f4c5  {date}",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"",
+        f"  \U0001f4ca  {report['total']} predicted  \u2502  {matched} verified",
+        f"",
+    ]
+
+    # Hit rates per market
+    def _rate(hits, total):
+        if total == 0: return "—"
+        pct = hits / total * 100
+        icon = "\u2705" if pct >= 70 else ("\U0001f7e1" if pct >= 55 else "\u274c")
+        return f"{icon} {hits}/{total} ({pct:.0f}%)"
+
+    lines.append(f"\u2500\u2500\u2500 *MARKET HIT RATES* \u2500\u2500\u2500")
+    lines.append(f"")
+
+    if report["o15_total"] > 0:
+        lines.append(f"  \u26bd Over 1.5:     {_rate(report['o15_hits'], report['o15_total'])}")
+    if report["dc1x_total"] > 0:
+        lines.append(f"  \U0001f3e0 1X Home/Draw: {_rate(report['dc1x_hits'], report['dc1x_total'])}")
+    if report["dc_x2_total"] > 0:
+        lines.append(f"  \u2708\ufe0f X2 Draw/Away: {_rate(report['dc_x2_hits'], report['dc_x2_total'])}")
+    if report["outcome_total"] > 0:
+        lines.append(f"  \U0001f3af 1X2 Outcome:  {_rate(report['outcome_hits'], report['outcome_total'])}")
+
+    if report["value_total"] > 0:
+        lines.append(f"")
+        lines.append(f"\u2500\u2500\u2500 *VALUE BETS* \u2500\u2500\u2500")
+        lines.append(f"  \U0001f4b0 Value picks:  {_rate(report['value_hits'], report['value_total'])}")
+
+    # Individual match results
+    lines.append(f"")
+    lines.append(f"\u2500\u2500\u2500 *MATCH RESULTS* \u2500\u2500\u2500")
+    lines.append(f"")
+
+    for m in report["matches"][:15]:  # cap at 15
+        result_line = f"  {m['home']} *{m['score']}* {m['away']}"
+        lines.append(result_line)
+        for market, prob, hit in m["checks"]:
+            icon = "\u2705" if hit else "\u274c"
+            lines.append(f"    {icon} {market} ({prob:.0%})")
+        lines.append("")
+
+    # Rolling stats
+    history = _load_json(RESULTS_FILE, {})
+    if history:
+        total_o15_h, total_o15_t = 0, 0
+        total_dc1x_h, total_dc1x_t = 0, 0
+        total_dcx2_h, total_dcx2_t = 0, 0
+        for d, r in history.items():
+            total_o15_h += r.get("o15_hits", 0); total_o15_t += r.get("o15_total", 0)
+            total_dc1x_h += r.get("dc1x_hits", 0); total_dc1x_t += r.get("dc1x_total", 0)
+            total_dcx2_h += r.get("dc_x2_hits", 0); total_dcx2_t += r.get("dc_x2_total", 0)
+
+        if total_o15_t + total_dc1x_t + total_dcx2_t > 0:
+            lines.append(f"\u2501\u2501\u2501 *ALL-TIME STATS* \u2501\u2501\u2501")
+            lines.append(f"  _({len(history)} days tracked)_")
+            if total_o15_t: lines.append(f"  \u26bd O1.5:  {_rate(total_o15_h, total_o15_t)}")
+            if total_dc1x_t: lines.append(f"  \U0001f3e0 1X:    {_rate(total_dc1x_h, total_dc1x_t)}")
+            if total_dcx2_t: lines.append(f"  \u2708\ufe0f X2:    {_rate(total_dcx2_h, total_dcx2_t)}")
+
+    return "\n".join(lines)
 
 VALID_STAGES = {"REGULAR_SEASON","GROUP_STAGE","LEAGUE_STAGE","ROUND_OF_16","QUARTER_FINALS","SEMI_FINALS","FINAL","LAST_16","LAST_32","LAST_64"}
 SKIP_STAGES = {"FRIENDLY","PRELIMINARY_ROUND","QUALIFICATION","QUALIFICATION_ROUND_1","QUALIFICATION_ROUND_2","QUALIFICATION_ROUND_3","PLAYOFF_ROUND","PLAYOFFS"}
@@ -595,6 +1025,20 @@ def format_prediction(pred):
             also = ", ".join(f"{b[0]} ({b[1]:.0%})" for b in bets[1:])
             lines.append(f"   \u21b3 Also strong: {also}")
 
+    # Value bets (edge over bookmakers)
+    if pred.get("value_bets"):
+        lines.append(f"")
+        lines.append(f"\u2500\u2500\u2500 \U0001f4b0 *VALUE BETS* \u2500\u2500\u2500")
+        for vb in pred["value_bets"][:3]:
+            edge_pct = vb["edge"] * 100
+            lines.append(
+                f"  \U0001f4a1 *{vb['market']}* @ {vb['odds']:.2f}"
+                f"  \u2502  Edge: +{edge_pct:.1f}%"
+            )
+            lines.append(
+                f"      Us: {vb['our_prob']:.0%}  vs  Book: {vb['implied_prob']:.0%}"
+            )
+
     if pred.get("home_form") or pred.get("away_form"):
         lines.append(f"")
         lines.append(f"\U0001f4c8 *Form:*")
@@ -637,6 +1081,9 @@ def format_tip(pred, rank):
     ]
     if tags:
         lines.append(f"  \U0001f4b0 {' \u2502 '.join(tags)}")
+    if pred.get("value_bets"):
+        vb_parts = [f"\U0001f4a1{v['market']} +{v['edge']*100:.0f}%" for v in pred["value_bets"][:2]]
+        lines.append(f"  {' \u2502 '.join(vb_parts)}")
     if form_str:
         lines.append(f"  {form_str.strip()}")
     lines.append(f"  {pred['confidence']}")
@@ -718,7 +1165,13 @@ def nav_keyboard(exclude=None):
     ]
     row2 = [InlineKeyboardButton(label, callback_data=cb) for label, cb in buttons2 if cb != exclude]
 
-    return InlineKeyboardMarkup([row1, row2])
+    buttons3 = [
+        ("\U0001f4ca Results", "nav_results"),
+        ("\U0001f4b0 Value", "nav_value"),
+    ]
+    row3 = [InlineKeyboardButton(label, callback_data=cb) for label, cb in buttons3 if cb != exclude]
+
+    return InlineKeyboardMarkup([row1, row2, row3])
 
 
 async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,6 +1187,8 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "nav_streaks": cmd_streaks_from_btn,
         "nav_goals": cmd_goals_from_btn,
         "nav_league": cmd_league_from_btn,
+        "nav_results": cmd_results_from_btn,
+        "nav_value": cmd_value_from_btn,
     }
     handler = nav_map.get(query.data)
     if handler:
@@ -755,8 +1210,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\u2501\u2501\u2501  *COMMANDS*  \u2501\u2501\u2501\n\n"
         "\U0001f916 *Predictions*\n"
         "  /predict  \u2014  Today's full analysis\n"
-        "  /tips     \u2014  Top picks ranked\n\n"
-        "\U0001f4ca *Streaks*\n"
+        "  /tips     \u2014  Top picks ranked\n"
+        "  /value    \u2014  Value bets (edge vs bookies)\n\n"
+        "\U0001f4ca *Tracking*\n"
+        "  /results  \u2014  Yesterday's hit rates\n\n"
+        "\U0001f525 *Streaks*\n"
         "  /streaks  \u2014  Winning streaks\n"
         "  /goals    \u2014  Goal-scoring streaks\n"
         "  /league   \u2014  Detailed by league\n"
@@ -767,7 +1225,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  \u2778 League position\n"
         "  \u2779 Form (exponential decay)\n"
         "  \u277a Streak momentum\n"
-        "  \u277b Head-to-head record\n\n"
+        "  \u277b Head-to-head record\n"
+        "  \u277c Bookmaker odds comparison\n\n"
         "\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard())
@@ -926,7 +1385,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # PREDICTION HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _fetch_league_predictions(code, info, date_from, date_to):
+async def _fetch_league_predictions(code, info, date_from, date_to, odds_map=None):
     """Fetch data and generate predictions for one league. Returns list of predictions."""
     predictions = []
     try:
@@ -966,6 +1425,16 @@ async def _fetch_league_predictions(code, info, date_from, date_to):
             pred = predict_match(home, away, team_stats, stks, elo_ratings, standings_map)
             pred["league"] = f"{info['flag']} {info['name']}"
             pred["kick_off"] = ko
+
+            # Attach value bets if odds available
+            if odds_map:
+                match_odds = _match_odds(odds_map, home, away)
+                pred["odds"] = match_odds
+                pred["value_bets"] = calculate_value_bets(pred, match_odds)
+            else:
+                pred["odds"] = None
+                pred["value_bets"] = []
+
             predictions.append(pred)
     except Exception as e:
         logger.error(f"Prediction error {code}: {e}")
@@ -973,17 +1442,20 @@ async def _fetch_league_predictions(code, info, date_from, date_to):
 
 
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    loading_parts = [
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
         "  \U0001f916  *ANALYSING MATCHES...*\n"
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
         "  \u2022 Building ELO ratings\n"
         "  \u2022 Computing Poisson xG\n"
         "  \u2022 Analysing form + streaks\n"
-        "  \u2022 Checking head-to-head\n\n"
-        "  _\u23f1 ~2 min (API rate limits)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        "  \u2022 Checking head-to-head\n"
+    ]
+    if ODDS_API_KEY:
+        loading_parts.append("  \u2022 Fetching bookmaker odds\n")
+    loading_parts.append("\n  _\u23f1 ~2 min (API rate limits)_")
+    await update.message.reply_text("".join(loading_parts), parse_mode=ParseMode.MARKDOWN)
+
     df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
     dt = datetime.utcnow().strftime("%Y-%m-%d")
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -993,7 +1465,9 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for code, info in FREE_LEAGUES.items():
         if info.get("type") == "CUP": continue
         if req > 0: await asyncio.sleep(7)
-        preds = await _fetch_league_predictions(code, info, df, dt)
+        # Fetch odds for this league (costs 1 API request per league)
+        odds_map = await fetch_odds(code) if ODDS_API_KEY else {}
+        preds = await _fetch_league_predictions(code, info, df, dt, odds_map)
         all_preds.extend(preds)
         req += 1
 
@@ -1026,6 +1500,9 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_msg += "\n\n\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
         await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_predict"))
 
+    # Save predictions for results tracking
+    save_predictions(all_preds)
+
 
 async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1044,13 +1521,17 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for code, info in FREE_LEAGUES.items():
         if info.get("type") == "CUP": continue
         if req > 0: await asyncio.sleep(7)
-        preds = await _fetch_league_predictions(code, info, df, dt)
+        odds_map = await fetch_odds(code) if ODDS_API_KEY else {}
+        preds = await _fetch_league_predictions(code, info, df, dt, odds_map)
         all_preds.extend(preds)
         req += 1
 
     if not all_preds:
         await update.message.reply_text("\U0001f4ad No upcoming matches today.\n_Try again on a match day._", parse_mode=ParseMode.MARKDOWN)
         return
+
+    # Save predictions for results tracking
+    save_predictions(all_preds)
 
     all_preds.sort(key=lambda x: max(x["over15"], x["double_home"], x["double_away"]), reverse=True)
     top = all_preds[:8]
@@ -1173,7 +1654,8 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
                 streak_lines.append("")
 
             await asyncio.sleep(7)
-            preds = await _fetch_league_predictions(code, info, df, dt)
+            odds_map = await fetch_odds(code) if ODDS_API_KEY else {}
+            preds = await _fetch_league_predictions(code, info, df, dt, odds_map)
             all_preds.extend(preds)
         except Exception as e: logger.error(f"Daily error {code}: {e}")
 
@@ -1266,6 +1748,195 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=cid, text=tip_text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e: logger.error(f"Daily tips msg error: {e}")
 
+    # Save today's predictions for results tracking
+    save_predictions(all_preds)
+
+    # ── Message 4: Yesterday's Results Report ─────────────────────────────
+    try:
+        report = await check_results()  # checks yesterday by default
+        if report and report["matched"] > 0:
+            save_results_report(report["date"], report)
+            results_text = format_results_report(report)
+            if results_text:
+                await context.bot.send_message(chat_id=cid, text=results_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Daily results check error: {e}")
+
+
+# ── /results Command ─────────────────────────────────────────────────────────
+
+async def cmd_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check yesterday's predictions against actual results."""
+    await update.message.reply_text(
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "  \U0001f4ca  *CHECKING RESULTS...*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "  \u2022 Fetching match scores\n"
+        "  \u2022 Comparing to predictions\n\n"
+        "  _\u23f1 ~1 min_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Check if user passed a date arg
+    target_date = None
+    if context.args:
+        try:
+            target_date = context.args[0]  # expect YYYY-MM-DD
+            datetime.strptime(target_date, "%Y-%m-%d")  # validate
+        except (ValueError, IndexError):
+            target_date = None
+
+    report = await check_results(target_date)
+
+    if not report or report["matched"] == 0:
+        date_str = target_date or (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        await update.message.reply_text(
+            f"\U0001f4ad No verified results for {date_str}.\n\n"
+            "_Predictions must be made first with /predict or /tips._\n"
+            "_Results are only available after matches finish._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=nav_keyboard("nav_results"),
+        )
+        return
+
+    save_results_report(report["date"], report)
+    text = format_results_report(report)
+
+    if len(text) > 4000:
+        # Split at match results
+        parts = text.split("\u2500\u2500\u2500 *MATCH RESULTS*")
+        if len(parts) == 2:
+            await update.message.reply_text(parts[0].strip(), parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "\u2500\u2500\u2500 *MATCH RESULTS*" + parts[1],
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=nav_keyboard("nav_results"),
+            )
+        else:
+            await update.message.reply_text(text[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_results"))
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_results"))
+
+
+async def cmd_results_from_btn(update, context):
+    await cmd_results(_fake_update(update), context)
+
+
+# ── /value Command ───────────────────────────────────────────────────────────
+
+async def cmd_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show today's value bets (edge over bookmakers)."""
+    if not ODDS_API_KEY:
+        await update.message.reply_text(
+            "\U0001f512 *Value Bets Unavailable*\n\n"
+            "The Odds API key is not configured.\n"
+            "Set `ODDS_API_KEY` env variable to enable.\n\n"
+            "_Free at the-odds-api.com (500 req/month)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=nav_keyboard("nav_value"),
+        )
+        return
+
+    await update.message.reply_text(
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "  \U0001f4b0  *SCANNING FOR VALUE...*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "  \u2022 Fetching bookmaker odds\n"
+        "  \u2022 Comparing to our model\n"
+        "  \u2022 Finding edges 5%+\n\n"
+        "  _\u23f1 ~2 min_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
+    dt = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    all_value = []
+    req = 0
+
+    for code, info in FREE_LEAGUES.items():
+        if info.get("type") == "CUP":
+            continue
+        if req > 0:
+            await asyncio.sleep(7)
+        odds_map = await fetch_odds(code)
+        if not odds_map:
+            req += 1
+            continue
+        preds = await _fetch_league_predictions(code, info, df, dt, odds_map)
+        for p in preds:
+            if p.get("value_bets"):
+                all_value.append(p)
+        req += 1
+
+    if not all_value:
+        await update.message.reply_text(
+            "\U0001f4ad *No value bets found today.*\n\n"
+            "_No matches where our model gives 5%+ edge over bookmakers._\n"
+            "_Try again closer to kick-off when more odds are available._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=nav_keyboard("nav_value"),
+        )
+        return
+
+    # Sort by best edge
+    all_value.sort(key=lambda p: max(v["edge"] for v in p["value_bets"]), reverse=True)
+
+    lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f4b0  *VALUE BETS*",
+        f"  \U0001f4c5  {today}",
+        f"  _Our edge over bookmakers_",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "",
+    ]
+
+    for p in all_value[:12]:
+        lines.append(f"\U0001f3c6 *{p['league']}*  \u2502  {p.get('kick_off', '')}")
+        lines.append(f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510")
+        lines.append(f"\u2502 *{p['home_team']}* vs *{p['away_team']}*")
+        lines.append(f"\u2502 xG: {p['home_xg']}-{p['away_xg']}  \u2502  ELO: {p['home_elo']}-{p['away_elo']}")
+
+        for vb in p["value_bets"][:3]:
+            edge_pct = vb["edge"] * 100
+            bar = _bar(vb["edge"] / 0.20)  # scale edge to bar (20% = full)
+            strength = "\U0001f525\U0001f525\U0001f525" if edge_pct >= 15 else ("\U0001f525\U0001f525" if edge_pct >= 10 else "\U0001f525")
+            lines.append(f"\u2502")
+            lines.append(f"\u2502 \U0001f4a1 *{vb['market']}* @ *{vb['odds']:.2f}*  {strength}")
+            lines.append(f"\u2502   Us: {vb['our_prob']:.0%}  vs  Book: {vb['implied_prob']:.0%}")
+            lines.append(f"\u2502   Edge: {bar} +{edge_pct:.1f}%")
+
+        lines.append(f"\u2502 {p['confidence']}")
+        lines.append(f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518")
+        lines.append("")
+
+    total_vb = sum(len(p["value_bets"]) for p in all_value)
+    lines.append(f"\u2501\u2501\u2501  *SUMMARY*  \u2501\u2501\u2501")
+    lines.append(f"  \U0001f4b0  {total_vb} value bets across {len(all_value)} matches")
+    lines.append(f"  _Edge = Our probability \u2212 Bookmaker implied probability_")
+    lines.append(f"  _Positive edge = potential long-term profit_")
+    lines.append(f"")
+    lines.append(f"\u26a0\ufe0f _Not financial advice. Gamble responsibly._")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        mid = len(text) // 2
+        split_at = text.rfind("\n\n", 0, mid)
+        if split_at > 0:
+            await update.message.reply_text(text[:split_at], parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(text[split_at:], parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_value"))
+        else:
+            await update.message.reply_text(text[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_value"))
+    else:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=nav_keyboard("nav_value"))
+
+    # Save predictions for results tracking
+    save_predictions(all_value)
+
+
+async def cmd_value_from_btn(update, context):
+    await cmd_value(_fake_update(update), context)
+
 
 def main():
     if TELEGRAM_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
@@ -1282,6 +1953,8 @@ def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("tips", cmd_tips))
+    app.add_handler(CommandHandler("results", cmd_results))
+    app.add_handler(CommandHandler("value", cmd_value))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav_"))
     app.add_handler(CallbackQueryHandler(league_callback, pattern=r"^league_"))
     app.add_handler(CallbackQueryHandler(region_callback, pattern=r"^region_"))
