@@ -543,104 +543,160 @@ def predict_match(home_team, away_team, stats, streaks, elo_ratings, standings_m
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 
+def _bar(pct, width=10):
+    """Render a visual progress bar."""
+    filled = round(pct * width)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def _strength_label(pct):
+    """Label for probability strength."""
+    if pct >= 0.85: return "\U0001f525\U0001f525\U0001f525"
+    if pct >= 0.75: return "\U0001f525\U0001f525"
+    if pct >= 0.65: return "\U0001f525"
+    return ""
+
+
 def format_prediction(pred):
-    # Determine best bet tag
-    best_bet = ""
-    if pred["over15"] >= 0.75:
-        best_bet = f"\u2705 Over 1.5 Goals ({pred['over15']:.0%})"
-    if pred["double_home"] >= 0.70 or pred["double_away"] >= 0.70:
-        dc_best = "1X" if pred["double_home"] >= pred["double_away"] else "X2"
-        dc_val = max(pred["double_home"], pred["double_away"])
-        dc_tag = f"\u2705 {dc_best} ({dc_val:.0%})"
-        best_bet = f"{best_bet} | {dc_tag}" if best_bet else dc_tag
+    # Best bet determination
+    bets = []
+    if pred["over15"] >= 0.60:
+        bets.append(("Over 1.5", pred["over15"]))
+    if pred["double_home"] >= 0.65:
+        bets.append(("1X Home/Draw", pred["double_home"]))
+    if pred["double_away"] >= 0.65:
+        bets.append(("X2 Draw/Away", pred["double_away"]))
+    bets.sort(key=lambda x: x[1], reverse=True)
 
     lines = [
-        f"\u26bd *{pred['home_team']}* vs *{pred['away_team']}*",
-        f"   ELO: {pred['home_elo']} vs {pred['away_elo']} | Pos: {pred['home_pos']} vs {pred['away_pos']}",
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+        f"\u26bd  *{pred['home_team']}*",
+        f"        \U0001f19a",
+        f"      *{pred['away_team']}*",
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518",
         f"",
-        f"\U0001f3af *Prediction:* {pred['prediction']}",
-        f"\U0001f4ca Score: *{pred['score_line']}* | xG: {pred['home_xg']} - {pred['away_xg']}",
+        f"\U0001f3af  {pred['prediction']}",
+        f"\U0001f4ca  Score: *{pred['score_line']}*  \u2502  xG: {pred['home_xg']} - {pred['away_xg']}",
+        f"\U0001f4aa  ELO: {pred['home_elo']} vs {pred['away_elo']}  \u2502  Pos: {pred['home_pos']} vs {pred['away_pos']}",
         f"",
-        f"\u26bd *Over 1.5 Goals:* {pred['over15']:.0%}",
-        f"\U0001f91d *Double Chance:*  1X: {pred['double_home']:.0%} | X2: {pred['double_away']:.0%}",
+        f"\u2500\u2500\u2500 \u26bd *OVER 1.5 GOALS* \u2500\u2500\u2500",
+        f"  {_bar(pred['over15'])}  *{pred['over15']:.0%}*  {_strength_label(pred['over15'])}",
+        f"",
+        f"\u2500\u2500\u2500 \U0001f91d *DOUBLE CHANCE* \u2500\u2500\u2500",
+        f"  1X  {_bar(pred['double_home'])}  *{pred['double_home']:.0%}*  {_strength_label(pred['double_home'])}",
+        f"  X2  {_bar(pred['double_away'])}  *{pred['double_away']:.0%}*  {_strength_label(pred['double_away'])}",
     ]
-    if best_bet:
+
+    if bets:
         lines.append(f"")
-        lines.append(f"\U0001f4b0 *Best Bet:* {best_bet}")
+        top_bet = bets[0]
+        lines.append(f"\U0001f4b0 *BEST BET:* {top_bet[0]} ({top_bet[1]:.0%})")
+        if len(bets) > 1:
+            also = ", ".join(f"{b[0]} ({b[1]:.0%})" for b in bets[1:])
+            lines.append(f"   \u21b3 Also strong: {also}")
+
     if pred.get("home_form") or pred.get("away_form"):
         lines.append(f"")
-        if pred.get("home_form"): lines.append(f"   \U0001f3e0 {pred['home_team'][:15]}: {pred['home_form']}")
-        if pred.get("away_form"): lines.append(f"   \u2708\ufe0f {pred['away_team'][:15]}: {pred['away_form']}")
+        lines.append(f"\U0001f4c8 *Form:*")
+        if pred.get("home_form"): lines.append(f"  \U0001f3e0 {pred['home_team'][:14]:14s}  {pred['home_form']}")
+        if pred.get("away_form"): lines.append(f"  \u2708\ufe0f {pred['away_team'][:14]:14s}  {pred['away_form']}")
+
     if pred["factors"]:
         lines.append(f"")
-        for f in pred["factors"]: lines.append(f"   {f}")
+        for fct in pred["factors"][:4]:
+            lines.append(f"  \u2022 {fct}")
+
     lines.append(f"")
-    lines.append(f"\U0001f3af Confidence: {pred['confidence']}")
-    lines.append(f"\u2500" * 30)
+    lines.append(f"\U0001f3af  {pred['confidence']}")
+    lines.append(f"\u2501" * 30)
     return "\n".join(lines)
 
 
 def format_tip(pred, rank):
     medal = ["\U0001f947", "\U0001f948", "\U0001f949"]
-    icon = medal[rank] if rank < 3 else f"  {rank + 1}."
+    icon = medal[rank] if rank < 3 else f"\u2003{rank + 1}\ufe0f\u20e3"
+
+    # Build bet tags
+    tags = []
+    if pred["over15"] >= 0.60:
+        tags.append(f"\u26bd O1.5 *{pred['over15']:.0%}*")
+    if pred["double_home"] >= 0.65:
+        tags.append(f"\U0001f3e0 1X *{pred['double_home']:.0%}*")
+    if pred["double_away"] >= 0.65:
+        tags.append(f"\u2708\ufe0f X2 *{pred['double_away']:.0%}*")
+
+    form_str = ""
+    if pred.get("home_form") and pred.get("away_form"):
+        form_str = f"\n  {pred['home_form']} vs {pred['away_form']}"
+    elif pred.get("home_form"):
+        form_str = f"\n  {pred['home_form']}"
+
     lines = [
         f"{icon} *{pred['home_team']}* vs *{pred['away_team']}*",
-        f"   \U0001f4ca Score: {pred['score_line']} | xG: {pred['home_xg']} - {pred['away_xg']}",
-        f"   ELO: {pred['home_elo']} vs {pred['away_elo']}",
+        f"  \U0001f4ca {pred['score_line']}  \u2502  xG {pred['home_xg']}-{pred['away_xg']}  \u2502  ELO {pred['home_elo']}-{pred['away_elo']}",
     ]
-    angles = []
-    if pred["over15"] >= 0.60: angles.append(f"\u26bd Over 1.5 ({pred['over15']:.0%})")
-    if pred["double_home"] >= 0.65: angles.append(f"\U0001f91d 1X ({pred['double_home']:.0%})")
-    if pred["double_away"] >= 0.65: angles.append(f"\U0001f91d X2 ({pred['double_away']:.0%})")
-    if angles:
-        lines.append(f"   \U0001f4b0 *{' | '.join(angles)}*")
-    if pred.get("home_form") or pred.get("away_form"):
-        form_str = ""
-        if pred.get("home_form"): form_str += f"{pred['home_form']}"
-        if pred.get("away_form"): form_str += f" vs {pred['away_form']}"
-        lines.append(f"   {form_str}")
-    lines.append(f"   Confidence: {pred['confidence']}")
+    if tags:
+        lines.append(f"  \U0001f4b0 {' \u2502 '.join(tags)}")
+    if form_str:
+        lines.append(f"  {form_str.strip()}")
+    lines.append(f"  {pred['confidence']}")
     return "\n".join(lines)
 
 
 def format_winning_streaks(streaks, league_name, top_n=10):
     sorted_teams = sorted(streaks.items(), key=lambda x: x[1]["win_streak"], reverse=True)[:top_n]
     if not sorted_teams or sorted_teams[0][1]["win_streak"] == 0:
-        return f"\U0001f4ca *{league_name}*\nNo active winning streaks found."
-    lines = [f"\U0001f525 *{league_name} \u2014 Winning Streaks*\n"]
+        return f"{league_name}\n_No active winning streaks_"
+    lines = [f"\U0001f525 *{league_name}*\n"]
     medal = ["\U0001f947", "\U0001f948", "\U0001f949"]
     for i, (team, data) in enumerate(sorted_teams):
         if data["win_streak"] == 0: break
-        icon = medal[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{icon} *{team}*\n    \U0001f3c6 {data['win_streak']} wins in a row\n    Form: {data['form']}")
+        icon = medal[i] if i < 3 else f"\u2003{i+1}."
+        streak_bar = "\U0001f7e2" * min(data["win_streak"], 10)
+        lines.append(f"{icon} *{team}*")
+        lines.append(f"     {streak_bar}  *{data['win_streak']}W*")
+        lines.append(f"     {data['form']}")
     return "\n".join(lines)
 
 
 def format_goal_streaks(streaks, league_name, top_n=10):
     sorted_teams = sorted(streaks.items(), key=lambda x: x[1]["goal_streak"], reverse=True)[:top_n]
     if not sorted_teams or sorted_teams[0][1]["goal_streak"] == 0:
-        return f"\U0001f4ca *{league_name}*\nNo active goal-scoring streaks found."
-    lines = [f"\u26bd *{league_name} \u2014 Goal-Scoring Streaks*\n"]
+        return f"{league_name}\n_No active goal-scoring streaks_"
+    lines = [f"\u26bd *{league_name}*\n"]
     medal = ["\U0001f947", "\U0001f948", "\U0001f949"]
     for i, (team, data) in enumerate(sorted_teams):
         if data["goal_streak"] == 0: break
-        icon = medal[i] if i < 3 else f"  {i+1}."
-        lines.append(f"{icon} *{team}*\n    \u26bd Scored in {data['goal_streak']} consecutive games\n    \U0001f4c8 {data['recent_goals']} goals in last 5 | Form: {data['form']}")
+        icon = medal[i] if i < 3 else f"\u2003{i+1}."
+        goal_bar = "\u26bd" * min(data["goal_streak"], 8)
+        lines.append(f"{icon} *{team}*")
+        lines.append(f"     {goal_bar}  *{data['goal_streak']} games*")
+        lines.append(f"     {data['recent_goals']}G in last 5  \u2502  {data['form']}")
     return "\n".join(lines)
 
 
 def format_full_report(streaks, league_name):
     sorted_teams = sorted(streaks.items(), key=lambda x: (x[1]["win_streak"], x[1]["goal_streak"]), reverse=True)[:15]
-    lines = [f"\U0001f4cb *{league_name} \u2014 Full Streak Report*\n"]
+    lines = [
+        f"\U0001f4cb *{league_name}*",
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+        "",
+    ]
     for team, data in sorted_teams:
         tags = []
-        if data["win_streak"] >= 3: tags.append(f"\U0001f525{data['win_streak']}W")
-        if data["unbeaten_streak"] >= 5: tags.append(f"\U0001f6e1\ufe0f{data['unbeaten_streak']}U")
-        if data["goal_streak"] >= 5: tags.append(f"\u26bd{data['goal_streak']}G")
-        if data["clean_sheet_streak"] >= 2: tags.append(f"\U0001f9e4{data['clean_sheet_streak']}CS")
-        t = " ".join(tags) if tags else "\u2014"
-        lines.append(f"\u25aa\ufe0f *{team}* {data['form']}\n    {t}")
-    lines.append("\n_Legend: W=Win streak, U=Unbeaten, G=Goal streak, CS=Clean sheets_")
+        if data["win_streak"] >= 3:
+            tags.append(f"\U0001f525 {data['win_streak']}W")
+        if data["unbeaten_streak"] >= 5:
+            tags.append(f"\U0001f6e1\ufe0f {data['unbeaten_streak']}U")
+        if data["goal_streak"] >= 5:
+            tags.append(f"\u26bd {data['goal_streak']}G")
+        if data["clean_sheet_streak"] >= 2:
+            tags.append(f"\U0001f9e4 {data['clean_sheet_streak']}CS")
+        tag_str = "  ".join(tags) if tags else "\u2796 No streak"
+        lines.append(f"*{team}*  {data['form']}")
+        lines.append(f"  {tag_str}")
+        lines.append("")
+    lines.append("_\U0001f525W = Wins  \U0001f6e1\ufe0fU = Unbeaten  \u26bdG = Goals  \U0001f9e4CS = Clean sheets_")
     return "\n".join(lines)
 
 
@@ -648,27 +704,31 @@ def format_full_report(streaks, league_name):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "\u26bd *Football Streak Tracker & AI Predictor v2* \u26bd\n\n"
-        "Track streaks and get data-driven match predictions.\n"
-        "Focused on *Over 1.5 Goals* (78% hit rate) and *Double Chance* (76-79% hit rate).\n\n"
-        "*\U0001f4ca Streak Commands:*\n"
-        "/streaks \u2014 Top winning streaks\n"
-        "/goals \u2014 Top goal-scoring streaks\n"
-        "/league \u2014 Detailed league streaks\n"
-        "/today \u2014 Today's matches\n\n"
-        "*\U0001f916 AI Prediction Commands:*\n"
-        "/predict \u2014 Full predictions for today\n"
-        "/tips \u2014 Best Over 1.5 & Double Chance picks\n\n"
-        "/help \u2014 Show this message\n\n"
-        "\U0001f9e0 *Prediction Model (6 layers):*\n"
-        "1\ufe0f\u20e3 Poisson goal model (attack/defense strength)\n"
-        "2\ufe0f\u20e3 ELO rating system (dynamic team strength)\n"
-        "3\ufe0f\u20e3 League position weighting\n"
-        "4\ufe0f\u20e3 Form analysis (exponential decay)\n"
-        "5\ufe0f\u20e3 Streak momentum + GD trajectory\n"
-        "6\ufe0f\u20e3 Head-to-head historical record\n\n"
-        "\U0001f4ca _Backtested on 552 matches_\n"
-        "\u26a0\ufe0f _Statistical estimates, not guarantees. Gamble responsibly._"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "  \u26bd  *FOOTBALL AI PREDICTOR*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "Data-driven predictions focused on the\n"
+        "two most profitable markets:\n\n"
+        "  \u26bd *Over 1.5 Goals*   \u2502  78% hit rate\n"
+        "  \U0001f91d *Double Chance*   \u2502  76-79% hit rate\n"
+        "  \U0001f4ca _Backtested on 552 real matches_\n\n"
+        "\u2501\u2501\u2501  *COMMANDS*  \u2501\u2501\u2501\n\n"
+        "\U0001f916 *Predictions*\n"
+        "  /predict  \u2014  Today's full analysis\n"
+        "  /tips     \u2014  Top picks ranked\n\n"
+        "\U0001f4ca *Streaks*\n"
+        "  /streaks  \u2014  Winning streaks\n"
+        "  /goals    \u2014  Goal-scoring streaks\n"
+        "  /league   \u2014  Detailed by league\n"
+        "  /today    \u2014  Today's fixtures\n\n"
+        "\u2501\u2501\u2501  *AI MODEL*  \u2501\u2501\u2501\n\n"
+        "  \u2776 Poisson goal model\n"
+        "  \u2777 ELO rating system\n"
+        "  \u2778 League position\n"
+        "  \u2779 Form (exponential decay)\n"
+        "  \u277a Streak momentum\n"
+        "  \u277b Head-to-head record\n\n"
+        "\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -676,7 +736,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 async def cmd_streaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("\U0001f504 Fetching streak data...\n_(~60 seconds)_", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\U0001f504 *Fetching streak data...*\n_\u23f1 ~60 seconds_", parse_mode=ParseMode.MARKDOWN)
     df = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
     dt = datetime.utcnow().strftime("%Y-%m-%d")
     msgs = []
@@ -696,7 +756,7 @@ async def cmd_streaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: await update.message.reply_text("\u274c Could not fetch streak data.")
 
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("\U0001f504 Fetching goal streaks...\n_(~60 seconds)_", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\U0001f504 *Fetching goal streaks...*\n_\u23f1 ~60 seconds_", parse_mode=ParseMode.MARKDOWN)
     df = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%d")
     dt = datetime.utcnow().strftime("%Y-%m-%d")
     msgs = []
@@ -790,8 +850,12 @@ async def league_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e: logger.error(f"Error: {e}"); await query.edit_message_text(f"\u274c Error: {e}")
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("\U0001f504 Checking today's fixtures...")
-    lines = ["\U0001f4c5 *Today's Matches*\n"]
+    await update.message.reply_text("\U0001f504 *Checking today's fixtures...*", parse_mode=ParseMode.MARKDOWN)
+    lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f4c5  *TODAY'S MATCHES*",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+    ]
     found = False
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
@@ -868,9 +932,14 @@ async def _fetch_league_predictions(code, info, date_from, date_to):
 
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001f916 *Generating AI predictions...*\n"
-        "_(ELO ratings + Poisson model + form + league position + streaks + H2H)_\n"
-        "_(This may take ~2 minutes due to API rate limits)_",
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "  \U0001f916  *ANALYSING MATCHES...*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "  \u2022 Building ELO ratings\n"
+        "  \u2022 Computing Poisson xG\n"
+        "  \u2022 Analysing form + streaks\n"
+        "  \u2022 Checking head-to-head\n\n"
+        "  _\u23f1 ~2 min (API rate limits)_",
         parse_mode=ParseMode.MARKDOWN,
     )
     df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
@@ -887,13 +956,14 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req += 1
 
     if not all_preds:
-        await update.message.reply_text("\u274c No upcoming matches found today.\nTry again on a match day.")
+        await update.message.reply_text("\U0001f4ad No upcoming matches found today.\n_Try again on a match day._", parse_mode=ParseMode.MARKDOWN)
         return
 
     header = (
-        f"\U0001f916 *AI Match Predictions \u2014 {today}*\n"
-        f"\U0001f4ca _6-layer model: Poisson + ELO + Position + Form + Streaks + H2H_\n"
-        f"{'=' * 30}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"  \U0001f916  *MATCH PREDICTIONS*\n"
+        f"  \U0001f4c5  {today}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
     )
     current_league = ""
     current_msg = header
@@ -902,7 +972,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lhdr = ""
         if pred["league"] != current_league:
             current_league = pred["league"]
-            lhdr = f"\n\U0001f3df\ufe0f *{current_league}*\n"
+            lhdr = f"\n\U0001f3c6 *{current_league}*\n"
         pt = lhdr + format_prediction(pred)
         if len(current_msg) + len(pt) > 3800:
             await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN)
@@ -911,13 +981,16 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_msg += "\n" + pt
 
     if current_msg:
-        current_msg += "\n\n\u26a0\ufe0f _Statistical estimates only. Not guarantees. Gamble responsibly._"
+        current_msg += "\n\n\u26a0\ufe0f _Not financial advice. Gamble responsibly._"
         await update.message.reply_text(current_msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001f52e *Finding best picks...*\n_(Scanning all leagues)_\n_(~2 minutes)_",
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        "  \U0001f52e  *FINDING BEST PICKS...*\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "  _\u23f1 ~2 min (scanning all leagues)_",
         parse_mode=ParseMode.MARKDOWN,
     )
     df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
@@ -934,15 +1007,21 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req += 1
 
     if not all_preds:
-        await update.message.reply_text("\u274c No upcoming matches today.\nTry again on a match day.")
+        await update.message.reply_text("\U0001f4ad No upcoming matches today.\n_Try again on a match day._", parse_mode=ParseMode.MARKDOWN)
         return
 
     all_preds.sort(key=lambda x: max(x["over15"], x["double_home"], x["double_away"]), reverse=True)
     top = all_preds[:8]
 
-    lines = [f"\U0001f52e *Top Picks \u2014 {today}*", "_Ranked by Over 1.5 & Double Chance strength_", "=" * 30, ""]
+    lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f52e  *TOP PICKS \u2014 {today}*",
+        f"  _Over 1.5 & Double Chance_",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "",
+    ]
     for i, pred in enumerate(top):
-        lines.append(f"*{pred['league']}* ({pred['kick_off']})")
+        lines.append(f"\U0001f3c6 *{pred['league']}*  \u2502  {pred.get('kick_off', '')}")
         lines.append(format_tip(pred, i))
         lines.append("")
 
@@ -950,15 +1029,15 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dc_1x = [p for p in all_preds if p["double_home"] >= 0.70]
     dc_x2 = [p for p in all_preds if p["double_away"] >= 0.70]
 
-    lines.append("=" * 30)
-    lines.append(f"\U0001f4ca *Today's Summary:*")
-    lines.append(f"   {len(all_preds)} matches analysed")
-    lines.append(f"   \u26bd {len(o15p)} strong Over 1.5 (75%+)")
-    lines.append(f"   \U0001f3e0 {len(dc_1x)} strong 1X Home/Draw (70%+)")
-    lines.append(f"   \u2708\ufe0f {len(dc_x2)} strong X2 Draw/Away (70%+)")
+    lines.append(f"\u2501\u2501\u2501  *SUMMARY*  \u2501\u2501\u2501")
     lines.append(f"")
-    lines.append(f"\U0001f4ca _Backtest: O1.5 hits 78% | 1X hits 76% | X2 hits 79%_")
-    lines.append(f"\u26a0\ufe0f _Statistical estimates only. Gamble responsibly._")
+    lines.append(f"  \U0001f4ca  {len(all_preds)} matches analysed")
+    lines.append(f"  \u26bd  {len(o15p)} strong Over 1.5  (75%+)")
+    lines.append(f"  \U0001f3e0  {len(dc_1x)} strong 1X         (70%+)")
+    lines.append(f"  \u2708\ufe0f  {len(dc_x2)} strong X2         (70%+)")
+    lines.append(f"")
+    lines.append(f"\U0001f4ca _Hit rates: O1.5 78% \u2502 1X 76% \u2502 X2 79%_")
+    lines.append(f"\u26a0\ufe0f _Not financial advice. Gamble responsibly._")
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -990,8 +1069,15 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.utcnow().strftime("%Y-%m-%d")
 
     # ── Message 1: Notable Streaks ───────────────────────────────────────
-    streak_lines = [f"\U0001f305 *Good Morning! Daily Football Briefing \u2014 {today}*\n"]
-    streak_lines.append(f"\U0001f525 *Notable Streaks Today:*\n")
+    streak_lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f305  *DAILY BRIEFING*",
+        f"  \U0001f4c5  {today}",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "",
+        "\U0001f525 *Notable Streaks:*",
+        "",
+    ]
     all_preds = []
     has_streaks = False
 
@@ -1031,9 +1117,10 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
     # ── Message 2: Full Predictions (like /predict) ──────────────────────
     header = (
-        f"\U0001f916 *AI Match Predictions \u2014 {today}*\n"
-        f"\U0001f4ca _6-layer model: Poisson + ELO + Position + Form + Streaks + H2H_\n"
-        f"{'=' * 30}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"  \U0001f916  *MATCH PREDICTIONS*\n"
+        f"  \U0001f4c5  {today}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
     )
     current_league = ""
     current_msg = header
@@ -1042,7 +1129,7 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
         lhdr = ""
         if pred["league"] != current_league:
             current_league = pred["league"]
-            lhdr = f"\n\U0001f3df\ufe0f *{current_league}*\n"
+            lhdr = f"\n\U0001f3c6 *{current_league}*\n"
         pt = lhdr + format_prediction(pred)
         if len(current_msg) + len(pt) > 3800:
             try:
@@ -1061,9 +1148,15 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
     all_preds.sort(key=lambda x: max(x["over15"], x["double_home"], x["double_away"]), reverse=True)
     top = all_preds[:8]
 
-    tip_lines = [f"\U0001f52e *Top Picks \u2014 {today}*", "_Ranked by Over 1.5 & Double Chance strength_", "=" * 30, ""]
+    tip_lines = [
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"  \U0001f52e  *TOP PICKS \u2014 {today}*",
+        f"  _Over 1.5 & Double Chance_",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "",
+    ]
     for i, pred in enumerate(top):
-        tip_lines.append(f"*{pred['league']}* ({pred.get('kick_off', '')})")
+        tip_lines.append(f"\U0001f3c6 *{pred['league']}*  \u2502  {pred.get('kick_off', '')}")
         tip_lines.append(format_tip(pred, i))
         tip_lines.append("")
 
@@ -1071,15 +1164,15 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
     dc_1x = [p for p in all_preds if p["double_home"] >= 0.70]
     dc_x2 = [p for p in all_preds if p["double_away"] >= 0.70]
 
-    tip_lines.append("=" * 30)
-    tip_lines.append(f"\U0001f4ca *Today's Summary:*")
-    tip_lines.append(f"   {len(all_preds)} matches analysed")
-    tip_lines.append(f"   \u26bd {len(o15p)} strong Over 1.5 (75%+)")
-    tip_lines.append(f"   \U0001f3e0 {len(dc_1x)} strong 1X Home/Draw (70%+)")
-    tip_lines.append(f"   \u2708\ufe0f {len(dc_x2)} strong X2 Draw/Away (70%+)")
+    tip_lines.append(f"\u2501\u2501\u2501  *SUMMARY*  \u2501\u2501\u2501")
     tip_lines.append(f"")
-    tip_lines.append(f"\U0001f4ca _Backtest: O1.5 hits 78% | 1X hits 76% | X2 hits 79%_")
-    tip_lines.append(f"\u26a0\ufe0f _Statistical estimates only. Gamble responsibly._")
+    tip_lines.append(f"  \U0001f4ca  {len(all_preds)} matches analysed")
+    tip_lines.append(f"  \u26bd  {len(o15p)} strong Over 1.5  (75%+)")
+    tip_lines.append(f"  \U0001f3e0  {len(dc_1x)} strong 1X         (70%+)")
+    tip_lines.append(f"  \u2708\ufe0f  {len(dc_x2)} strong X2         (70%+)")
+    tip_lines.append(f"")
+    tip_lines.append(f"\U0001f4ca _Hit rates: O1.5 78% \u2502 1X 76% \u2502 X2 79%_")
+    tip_lines.append(f"\u26a0\ufe0f _Not financial advice. Gamble responsibly._")
 
     tip_text = "\n".join(tip_lines)
     try:
