@@ -976,13 +976,19 @@ async def cmd_tips(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Send full daily predictions + tips at 08:00 UTC automatically."""
     chat_id = os.environ.get("DAILY_CHAT_ID")
     if not chat_id: return
+    cid = int(chat_id)
     df = (datetime.utcnow() - timedelta(days=150)).strftime("%Y-%m-%d")
     dt = datetime.utcnow().strftime("%Y-%m-%d")
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    summary = [f"\U0001f305 *Daily Streak & AI Prediction Summary \u2014 {today}*\n"]
+
+    # ── Message 1: Notable Streaks ───────────────────────────────────────
+    streak_lines = [f"\U0001f305 *Good Morning! Daily Football Briefing \u2014 {today}*\n"]
+    streak_lines.append(f"\U0001f525 *Notable Streaks Today:*\n")
     all_preds = []
+    has_streaks = False
 
     for i, (code, info) in enumerate(FREE_LEAGUES.items()):
         if info.get("type") == "CUP": continue
@@ -993,29 +999,104 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
             stks = calculate_streaks(historical)
             notable = {t: d for t, d in stks.items() if d["win_streak"] >= 3 or d["goal_streak"] >= 5}
             if notable:
-                summary.append(f"\n{info['flag']} *{info['name']}*")
-                for t, d in sorted(notable.items(), key=lambda x: x[1]["win_streak"], reverse=True):
+                has_streaks = True
+                streak_lines.append(f"{info['flag']} *{info['name']}*")
+                for t, d in sorted(notable.items(), key=lambda x: x[1]["win_streak"], reverse=True)[:5]:
                     parts = []
                     if d["win_streak"] >= 3: parts.append(f"\U0001f525 {d['win_streak']}W")
+                    if d["unbeaten_streak"] >= 5: parts.append(f"\U0001f6e1\ufe0f {d['unbeaten_streak']}U")
                     if d["goal_streak"] >= 5: parts.append(f"\u26bd {d['goal_streak']}G")
-                    summary.append(f"  {t}: {' | '.join(parts)} {d['form']}")
+                    if d["clean_sheet_streak"] >= 2: parts.append(f"\U0001f9e4 {d['clean_sheet_streak']}CS")
+                    streak_lines.append(f"  {t}: {' | '.join(parts)} {d['form']}")
+                streak_lines.append("")
 
             await asyncio.sleep(7)
             preds = await _fetch_league_predictions(code, info, df, dt)
             all_preds.extend(preds)
         except Exception as e: logger.error(f"Daily error {code}: {e}")
 
-    if all_preds:
-        all_preds.sort(key=lambda x: x["confidence_score"], reverse=True)
-        summary.append(f"\n{'=' * 25}")
-        summary.append(f"\U0001f52e *Top Predictions:*")
-        for pred in all_preds[:5]:
-            mp = max(pred["home_win"], pred["draw"], pred["away_win"])
-            summary.append(f"  {pred['home_team']} vs {pred['away_team']}\n    \U0001f3af {pred['prediction']} ({mp:.0%})\n    ELO: {pred['home_elo']} vs {pred['away_elo']} | xG: {pred['home_xg']}-{pred['away_xg']}")
+    if has_streaks:
+        try:
+            await context.bot.send_message(chat_id=cid, text="\n".join(streak_lines), parse_mode=ParseMode.MARKDOWN)
+        except Exception as e: logger.error(f"Daily streak msg error: {e}")
 
-    if len(summary) > 1:
-        summary.append(f"\n\u26a0\ufe0f _Statistical estimates only._")
-        await context.bot.send_message(chat_id=int(chat_id), text="\n".join(summary), parse_mode=ParseMode.MARKDOWN)
+    if not all_preds:
+        await context.bot.send_message(chat_id=cid, text=f"\U0001f4c5 *{today}*\nNo matches scheduled today across tracked leagues.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── Message 2: Full Predictions (like /predict) ──────────────────────
+    header = (
+        f"\U0001f916 *AI Match Predictions \u2014 {today}*\n"
+        f"\U0001f4ca _6-layer model: Poisson + ELO + Position + Form + Streaks + H2H_\n"
+        f"{'=' * 30}\n"
+    )
+    current_league = ""
+    current_msg = header
+
+    for pred in all_preds:
+        lhdr = ""
+        if pred["league"] != current_league:
+            current_league = pred["league"]
+            lhdr = f"\n\U0001f3df\ufe0f *{current_league}*\n"
+        pt = lhdr + format_prediction(pred)
+        if len(current_msg) + len(pt) > 3800:
+            try:
+                await context.bot.send_message(chat_id=cid, text=current_msg, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e: logger.error(f"Daily pred msg error: {e}")
+            current_msg = pt
+        else:
+            current_msg += "\n" + pt
+
+    if current_msg:
+        try:
+            await context.bot.send_message(chat_id=cid, text=current_msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e: logger.error(f"Daily pred msg error: {e}")
+
+    # ── Message 3: Top Tips (like /tips) ─────────────────────────────────
+    all_preds.sort(key=lambda x: x["confidence_score"], reverse=True)
+    top = all_preds[:8]
+
+    tip_lines = [f"\U0001f52e *Top Picks \u2014 {today}*", "_Ranked by AI confidence_", "=" * 30, ""]
+    for i, pred in enumerate(top):
+        tip_lines.append(f"*{pred['league']}* ({pred.get('kick_off', '')})")
+        tip_lines.append(format_tip(pred, i))
+        tip_lines.append("")
+
+    hc = [p for p in all_preds if p["confidence_score"] >= 0.72]
+    o15p = [p for p in all_preds if p["over15"] >= 0.80]
+    btts_p = [p for p in all_preds if p["btts"] >= 0.65]
+    dc_p = [p for p in all_preds if p["double_home"] >= 0.80 or p["double_away"] >= 0.80]
+
+    tip_lines.append("=" * 30)
+    tip_lines.append(f"\U0001f4ca *Today's Summary:*")
+    tip_lines.append(f"   {len(all_preds)} matches analysed")
+    tip_lines.append(f"   \U0001f7e2 {len(hc)} high-confidence picks")
+    tip_lines.append(f"   \u26bd {len(o15p)} strong Over 1.5")
+    tip_lines.append(f"   \U0001f3af {len(btts_p)} likely BTTS")
+    tip_lines.append(f"   \U0001f91d {len(dc_p)} strong Double Chance")
+    tip_lines.append(f"")
+    tip_lines.append(f"\u26a0\ufe0f _Statistical estimates only. Gamble responsibly._")
+
+    tip_text = "\n".join(tip_lines)
+    try:
+        if len(tip_text) > 4000:
+            mid = len(top) // 2
+            msg1 = tip_lines[:4]
+            for i, pred in enumerate(top[:mid]):
+                msg1.append(f"*{pred['league']}* ({pred.get('kick_off', '')})")
+                msg1.append(format_tip(pred, i))
+                msg1.append("")
+            await context.bot.send_message(chat_id=cid, text="\n".join(msg1), parse_mode=ParseMode.MARKDOWN)
+            msg2 = []
+            for i, pred in enumerate(top[mid:]):
+                msg2.append(f"*{pred['league']}* ({pred.get('kick_off', '')})")
+                msg2.append(format_tip(pred, i + mid))
+                msg2.append("")
+            msg2.extend(tip_lines[-8:])
+            await context.bot.send_message(chat_id=cid, text="\n".join(msg2), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await context.bot.send_message(chat_id=cid, text=tip_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e: logger.error(f"Daily tips msg error: {e}")
 
 
 def main():
